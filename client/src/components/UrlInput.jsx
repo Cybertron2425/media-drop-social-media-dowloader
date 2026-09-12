@@ -46,7 +46,7 @@ export default function UrlInput({ onSubmit, isLoading, onClear }) {
             onChange={(e) => setValue(e.target.value)}
             placeholder="Paste Instagram or Facebook URL here..."
             aria-label="Paste Instagram or Facebook URL"
-            className="w-full bg-transparent px-2.5 py-3 text-sm sm:text-base text-slate-900 placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500 focus:outline-none"
+            className="w-full bg-transparent px-2.5 py-3 text-base text-slate-900 placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500 focus:outline-none"
           />
 
           {/* Clear "X" Button (only visible when input has content) */}
