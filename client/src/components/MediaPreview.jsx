@@ -21,6 +21,7 @@ function getPlatformTypeLabel(platform, type, isHighlight) {
   let tName = 'Video';
   if (type === 'reel') tName = 'Reel';
   else if (type === 'image' || type === 'photo') tName = 'Photo';
+  else if (type === 'story') tName = 'Story';
   else if (type === 'video') tName = 'Video';
 
   if (isHighlight) {

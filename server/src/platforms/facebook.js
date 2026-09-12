@@ -85,10 +85,7 @@ export class FacebookAdapter extends BaseAdapter {
       }
     }
 
-    // Reject Facebook Stories
-    if (/(?:stories)\//i.test(targetUrl) || /(?:stories)\//i.test(url)) {
-      throw new PlatformLimitationError('Facebook Stories are currently not supported.');
-    }
+    const isStory = /(?:stories)\//i.test(targetUrl) || /(?:stories)\//i.test(url);
 
     // Extraction strategy: evaluate legitimate public surfaces in order
     const surfaces = [
@@ -255,6 +252,12 @@ export class FacebookAdapter extends BaseAdapter {
     }
 
     if (!extractedData) {
+      if (isStory) {
+        throw new PlatformLimitationError(
+          'Facebook Stories are currently not available for unauthenticated downloads.'
+        );
+      }
+
       if (isExplicitlyPrivate) {
         // CASE A: Video is genuinely from a private group or profile
         throw new PlatformLimitationError(
@@ -332,7 +335,9 @@ export class FacebookAdapter extends BaseAdapter {
       });
     }
 
-    const mediaType = extractedData.imageUrl
+    const mediaType = isStory
+      ? 'story'
+      : extractedData.imageUrl
       ? 'image'
       : (/(?:reel|reels)/i.test(targetUrl) || /(?:reel|reels)/i.test(url))
       ? 'reel'

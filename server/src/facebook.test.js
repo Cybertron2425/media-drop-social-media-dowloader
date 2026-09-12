@@ -200,4 +200,74 @@ test('Facebook Adapter - Post, Share, and Reel Handling', async (t) => {
     assert.equal(streamRes.headers['content-type'], 'image/jpeg');
     assert.equal(streamRes.buffer.length, fakeImageBuffer.length);
   });
+
+  await t.test('returns clear limitation error when Facebook Story requires login', async () => {
+    const adapter = new FacebookAdapter();
+    const storyUrl = 'https://www.facebook.com/stories/102746328736935/UzpfSVNDOjIxMjE3MjAyMTU0MDQyMTQ=/?view_single=1&source=shared_permalink&mibextid=wwXIfr';
+
+    // Mock response simulating Facebook redirecting unauthenticated requests to login
+    axios.head = async () => {
+      throw new Error('HEAD failed');
+    };
+
+    axios.get = async (url) => {
+      return {
+        status: 200,
+        data: '<html><head><title>Facebook - Log In</title></head><body><form action="/login"></form></body></html>',
+        request: { res: { responseUrl: 'https://m.facebook.com/login/?next=' + encodeURIComponent(url) } },
+      };
+    };
+
+    await assert.rejects(
+      async () => {
+        await adapter.analyze(storyUrl);
+      },
+      (err) => {
+        assert.equal(err.name, 'PlatformLimitationError');
+        assert.equal(
+          err.message,
+          'Facebook Stories are currently not available for unauthenticated downloads.'
+        );
+        return true;
+      }
+    );
+  });
+
+  await t.test('extracts media if Facebook Story exposes public OpenGraph content', async () => {
+    const adapter = new FacebookAdapter();
+    const storyUrl = 'https://www.facebook.com/stories/12345/67890/';
+
+    axios.head = async () => ({
+      request: { res: { responseUrl: storyUrl } },
+      headers: {},
+    });
+
+    axios.get = async (url, config) => {
+      if (config?.headers?.['User-Agent']?.includes('iPhone')) {
+        return {
+          status: 200,
+          data: `
+            <html>
+              <head>
+                <title>Public Story</title>
+                <meta property="og:title" content="Public Story Media" />
+                <meta property="og:type" content="article" />
+                <meta property="og:image" content="https://scontent.xx.fbcdn.net/v/story.jpg" />
+                <link rel="canonical" href="https://www.facebook.com/stories/12345/67890/" />
+              </head>
+              <body></body>
+            </html>
+          `,
+          request: { res: { responseUrl: storyUrl } },
+        };
+      }
+      return { status: 200, data: '<html></html>', request: { res: { responseUrl: url } } };
+    };
+
+    const result = await adapter.analyze(storyUrl);
+    assert.equal(result.platform, 'facebook');
+    assert.equal(result.type, 'story');
+    assert.equal(result.title, 'Public Story Media');
+    assert.equal(result.formats[0].format, 'jpg');
+  });
 });
