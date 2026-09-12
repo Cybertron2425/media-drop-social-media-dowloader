@@ -17,3 +17,12 @@ export const downloadLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, error: 'Too many requests. Please slow down and try again shortly.' },
 });
+
+export const bulkDownloadLimiter = rateLimit({
+  windowMs,
+  max: parseInt(process.env.RATE_LIMIT_BULK, 10) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many bulk download requests. Please slow down and try again shortly.' },
+});
+

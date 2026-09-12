@@ -10,6 +10,7 @@
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@ffprobe-installer/ffprobe": "^2.1.2",
+    "archiver": "^8.0.0",
     "axios": "^1.7.7",
     "cheerio": "^1.2.0",
     "cors": "^2.8.5",

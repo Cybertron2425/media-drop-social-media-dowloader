@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { ZipArchive } from 'archiver';
 import { nanoid } from 'nanoid';
 import { consumeDownloadToken, peekDownloadToken } from '../services/downloadTokenStore.js';
 import { storePreparedFile, consumePreparedFile } from '../services/preparedFileStore.js';
@@ -274,3 +275,184 @@ export async function downloadHandler(req, res) {
   }
   return streamDownload(downloadId, req, res);
 }
+
+/**
+ * Bulk download handler – streams a ZIP archive containing all requested media items.
+ * Accepts { downloadIds: string[], title?: string }
+ */
+export async function bulkDownloadHandler(req, res) {
+  const start = Date.now();
+  const { downloadIds, title } = req.body || {};
+
+  if (!Array.isArray(downloadIds) || downloadIds.length === 0) {
+    return res.status(400).json({ success: false, error: 'Please provide a valid list of media items to download.' });
+  }
+
+  if (downloadIds.length > 50) {
+    return res.status(400).json({ success: false, error: 'Cannot download more than 50 items at once.' });
+  }
+
+  // Create an isolated temporary directory for downloading and bundling the files
+  const bulkDir = path.join(os.tmpdir(), `md_bulk_${nanoid(8)}`);
+  let dirCreated = false;
+
+  const cleanup = async () => {
+    if (dirCreated) {
+      try {
+        await fs.promises.rm(bulkDir, { recursive: true, force: true });
+      } catch (err) {
+        console.error('[Bulk Download] Cleanup error:', err.message);
+      }
+    }
+  };
+
+  try {
+    await fs.promises.mkdir(bulkDir, { recursive: true });
+    dirCreated = true;
+
+    // Validate and consume tokens (single-use)
+    const validItems = [];
+    for (const id of downloadIds) {
+      if (typeof id !== 'string') continue;
+      const token = consumeDownloadToken(id);
+      if (token) {
+        validItems.push({ id, token });
+      }
+    }
+
+    if (validItems.length === 0) {
+      await cleanup();
+      return res.status(404).json({
+        success: false,
+        error: 'This download link has expired. Please analyze the media again.',
+      });
+    }
+
+    const preparedFiles = [];
+    let totalBytesWritten = 0;
+
+    // Download each item into the temporary directory
+    for (let i = 0; i < validItems.length; i++) {
+      const { id, token } = validItems[i];
+      try {
+        const adapter = getAdapter(token.platform) || resolveAdapter(token.sourceUrl || 'https://placeholder.invalid');
+        if (!adapter) {
+          console.warn(`[Bulk Download] Unsupported platform adapter for item ${id}`);
+          continue;
+        }
+
+        const result = await adapter.download(token.sourceUrl, {
+          formatId: token.formatId,
+          sourceUrl: token.sourceUrl,
+          meta: token.meta,
+        });
+
+        // Determine safe filename and prevent path traversal
+        let rawFilename = result.filename || `media_${i + 1}`;
+        // Strips any directory components (e.g. ../ or /)
+        rawFilename = path.basename(rawFilename);
+        const ext = path.extname(rawFilename) || (result.mimeType?.includes('video') ? '.mp4' : '.jpg');
+        const baseWithoutExt = path.basename(rawFilename, ext);
+        const safeBase = sanitizeFilename(baseWithoutExt).slice(0, 60) || `media_${i + 1}`;
+        const safeExt = ext.replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10) || '.bin';
+        const entryName = `${String(i + 1).padStart(2, '0')}_${safeBase}${safeExt.startsWith('.') ? safeExt : `.${safeExt}`}`;
+        const tempFilePath = path.join(bulkDir, entryName);
+
+        if (result._tempFilePath) {
+          // Move/copy the pre-existing temp file
+          await fs.promises.copyFile(result._tempFilePath, tempFilePath);
+          fs.promises.unlink(result._tempFilePath).catch(() => {});
+          result.stream?.destroy?.();
+        } else {
+          // Pipe network stream to file
+          let fileBytes = 0;
+          await new Promise((resolve, reject) => {
+            const ws = fs.createWriteStream(tempFilePath);
+            result.stream.on('data', (chunk) => {
+              fileBytes += chunk.length;
+              if (totalBytesWritten + fileBytes > MAX_FILE_SIZE_BYTES * 2) {
+                ws.destroy();
+                result.stream.destroy();
+                reject(new Error('Bulk download exceeds maximum allowed size.'));
+              }
+            });
+            result.stream.pipe(ws);
+            ws.on('finish', resolve);
+            ws.on('error', reject);
+            result.stream.on('error', reject);
+          });
+          totalBytesWritten += fileBytes;
+        }
+
+        preparedFiles.push({ path: tempFilePath, entryName });
+      } catch (err) {
+        console.warn(`[Bulk Download] Failed to prepare item ${id}:`, err.message);
+        // Continue processing remaining items to avoid failing the whole batch
+      }
+    }
+
+    if (preparedFiles.length === 0) {
+      await cleanup();
+      return res.status(502).json({
+        success: false,
+        error: 'Failed to retrieve media items. Please try again.',
+      });
+    }
+
+    // Set up ZIP streaming response
+    const zipBase = title ? `${sanitizeFilename(title)}_all_media` : 'mediadrop-download';
+    const safeZipName = `${zipBase}.zip`;
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeZipName}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    const archive = new ZipArchive({
+      zlib: { level: 5 },
+    });
+
+    let cleanedUp = false;
+    const safeCleanup = () => {
+      if (!cleanedUp) {
+        cleanedUp = true;
+        cleanup();
+      }
+    };
+
+    archive.on('error', (err) => {
+      console.error('[Bulk Download Archive Error]:', err.message);
+      safeCleanup();
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: 'Failed to compress media items.' });
+      } else {
+        res.destroy(err);
+      }
+    });
+
+    res.on('finish', () => {
+      safeCleanup();
+      logEvent({ requestId: req.id, operation: 'bulk_download', durationMs: Date.now() - start, success: true, count: preparedFiles.length });
+    });
+
+    res.on('close', () => {
+      safeCleanup();
+    });
+
+    archive.pipe(res);
+
+    for (const file of preparedFiles) {
+      archive.file(file.path, { name: file.entryName });
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error('[Bulk Download Handler Error]:', err);
+    await cleanup();
+    if (!res.headersSent) {
+      const friendly = sanitizeErrorMessage(err.message);
+      return res.status(500).json({ success: false, error: friendly });
+    } else {
+      res.destroy(err);
+    }
+  }
+}
+

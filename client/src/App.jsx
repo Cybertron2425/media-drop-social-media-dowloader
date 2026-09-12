@@ -8,7 +8,7 @@ import PlatformGrid from './components/PlatformGrid.jsx';
 import FAQ from './components/FAQ.jsx';
 import Footer from './components/Footer.jsx';
 import { useTheme } from './hooks/useTheme.js';
-import { analyzeUrl, downloadFormat } from './services/api.js';
+import { analyzeUrl, downloadFormat, downloadBulk } from './services/api.js';
 
 export default function App() {
   const [theme, toggleTheme] = useTheme();
@@ -18,6 +18,7 @@ export default function App() {
   const [downloadError, setDownloadError] = useState('');
   const [downloadingId, setDownloadingId] = useState(null);
   const [downloadStage, setDownloadStage] = useState(null); // 'preparing' | 'processing' | 'ready' | 'complete'
+  const [isBulkDownloading, setIsBulkDownloading] = useState(false);
 
   async function handleAnalyze(url) {
     setStatus('loading');
@@ -39,10 +40,11 @@ export default function App() {
     setDownloadError('');
     setStatus('idle');
     setMedia(null);
+    setIsBulkDownloading(false);
   }
 
   async function handleDownload(downloadId) {
-    if (downloadingId) return;
+    if (downloadingId || isBulkDownloading) return;
     setDownloadingId(downloadId);
     setDownloadError('');
     try {
@@ -55,6 +57,21 @@ export default function App() {
       setDownloadError(err.message);
       setDownloadingId(null);
       setDownloadStage(null);
+    }
+  }
+
+  async function handleDownloadBulk(downloadIds, title) {
+    if (isBulkDownloading || downloadingId) return;
+    setIsBulkDownloading(true);
+    setDownloadError('');
+    try {
+      await downloadBulk(downloadIds, title);
+      setTimeout(() => {
+        setIsBulkDownloading(false);
+      }, 2000);
+    } catch (err) {
+      setDownloadError(err.message);
+      setIsBulkDownloading(false);
     }
   }
 
@@ -90,8 +107,10 @@ export default function App() {
               <MediaPreview
                 media={media}
                 onDownload={handleDownload}
+                onDownloadBulk={handleDownloadBulk}
                 downloadingId={downloadingId}
                 downloadStage={downloadStage}
+                isBulkDownloading={isBulkDownloading}
               />
             </div>
           )}

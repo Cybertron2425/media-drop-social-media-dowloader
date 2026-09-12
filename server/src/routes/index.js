@@ -6,8 +6,9 @@ import {
   validateDownloadHandler,
   prepareDownloadHandler,
   streamPreparedHandler,
+  bulkDownloadHandler,
 } from '../controllers/downloadController.js';
-import { analyzeLimiter, downloadLimiter } from '../middleware/rateLimiters.js';
+import { analyzeLimiter, downloadLimiter, bulkDownloadLimiter } from '../middleware/rateLimiters.js';
 import { listPlatforms } from '../platforms/registry.js';
 
 const router = Router();
@@ -15,6 +16,10 @@ const router = Router();
 router.get('/health', (_req, res) => res.json({ success: true, status: 'ok' }));
 router.get('/platforms', (_req, res) => res.json({ success: true, platforms: listPlatforms() }));
 router.post('/analyze', analyzeLimiter, analyzeHandler);
+
+// ── Bulk download endpoint (Download All ZIP) ───────────────────────────────
+router.post('/download-all', bulkDownloadLimiter, bulkDownloadHandler);
+router.post('/download/bulk', bulkDownloadLimiter, bulkDownloadHandler);
 
 // ── Two-phase download (browser frontend) ───────────────────────────────────
 // Phase 1: client awaits this (may take minutes for 4K); shows processing UI.

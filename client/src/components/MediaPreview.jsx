@@ -25,17 +25,27 @@ function getPlatformTypeLabel(platform, type, isHighlight) {
   return `${pName} · ${tName}`;
 }
 
-export default function MediaPreview({ media, onDownload, downloadingId, downloadStage }) {
+export default function MediaPreview({
+  media,
+  onDownload,
+  onDownloadBulk,
+  downloadingId,
+  downloadStage,
+  isBulkDownloading,
+}) {
   const durationFormatted = formatDuration(media.duration);
 
   // If multiple items are available (e.g. Highlight with multiple stories)
   if (media.items && Array.isArray(media.items) && media.items.length > 1) {
     function handleDownloadAll() {
-      // Trigger download for each item sequentially
-      for (const item of media.items) {
-        if (item.formats?.[0]?.downloadId) {
-          onDownload(item.formats[0].downloadId);
-        }
+      if (isBulkDownloading || downloadingId) return;
+      const downloadIds = media.items
+        .map((item) => item.formats?.[0]?.downloadId)
+        .filter(Boolean);
+
+      if (!downloadIds.length) return;
+      if (onDownloadBulk) {
+        onDownloadBulk(downloadIds, media.title);
       }
     }
 
@@ -55,14 +65,27 @@ export default function MediaPreview({ media, onDownload, downloadingId, downloa
           <button
             type="button"
             onClick={handleDownloadAll}
-            className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-300 transition-colors"
+            disabled={isBulkDownloading || !!downloadingId}
+            className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-60 disabled:cursor-not-allowed dark:border-emerald-500/30 dark:bg-emerald-950/40 dark:text-emerald-300 transition-colors"
           >
-            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
-            <span>Download All</span>
+            {isBulkDownloading ? (
+              <>
+                <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                </svg>
+                <span>Preparing download...</span>
+              </>
+            ) : (
+              <>
+                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
+                </svg>
+                <span>Download All</span>
+              </>
+            )}
           </button>
         </div>
 
