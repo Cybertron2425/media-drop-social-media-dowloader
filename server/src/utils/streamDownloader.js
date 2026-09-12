@@ -24,6 +24,9 @@ export async function downloadStream(url, options = {}) {
       },
     });
   } catch (err) {
+    console.error(
+      `[DownloadStream Error] target=${targetUrl.slice(0, 80)} status=${err.response?.status} contentType=${err.response?.headers?.['content-type']} code=${err.code} err=${err.message}`
+    );
     if (
       err.response?.status === 403 ||
       err.response?.status === 404 ||

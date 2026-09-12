@@ -6,7 +6,7 @@ export default function PlatformGrid() {
       </p>
 
       {/* Desktop: side-by-side slim pills (40-44px). Mobile: vertically stacked slim pills (38-42px) */}
-      <div className="flex flex-col sm:flex-row items-center justify-center gap-2 sm:gap-2.5 max-w-full px-2">
+      <div className="flex flex-col sm:flex-row items-center justify-center gap-2 sm:gap-2.5 max-w-full px-2 flex-wrap">
         {/* Instagram Pill */}
         <div className="inline-flex flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-full border border-pink-500/20 bg-pink-500/5 px-2.5 sm:px-3 py-1 sm:py-1.5 h-[38px] sm:h-[42px] max-h-[44px] transition-all hover:border-pink-500/35 hover:bg-pink-500/10 dark:border-pink-400/25 dark:bg-pink-500/10 shadow-sm whitespace-nowrap w-fit">
           <svg
@@ -42,6 +42,82 @@ export default function PlatformGrid() {
           <span className="h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
           <span className="text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
             Reels · Videos · Photos
+          </span>
+        </div>
+
+        {/* Snapchat Pill */}
+        <div className="inline-flex flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-full border border-amber-500/20 bg-amber-500/5 px-2.5 sm:px-3 py-1 sm:py-1.5 h-[38px] sm:h-[42px] max-h-[44px] transition-all hover:border-amber-500/35 hover:bg-amber-500/10 dark:border-yellow-400/25 dark:bg-yellow-500/10 shadow-sm whitespace-nowrap w-fit">
+          <svg
+            className="h-[20px] w-[20px] sm:h-[22px] sm:w-[22px] shrink-0 text-amber-500 dark:text-yellow-400"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M12.003 2c-3.136 0-5.385 2.193-5.385 5.074 0 .61.161 1.41.42 2.015.08.188.106.326.042.441-.073.13-.263.228-.48.312-1.077.417-1.996 1.05-2.007 2.072 0 .657.416 1.157 1.01 1.487.498.276 1.106.417 1.57.47.165.019.267.112.287.213.067.332.617.438 1.03.498.246.036.438.064.526.155.15.154.084.53-.133.957-.04.079-.115.157-.225.234-.492.348-1.503.737-3.088 1.127-.245.06-.41.282-.395.534.015.25.197.458.441.503 1.123.208 2.378.435 3.327.948.163.088.24.237.212.404-.047.28-.403.468-.828.687-.63.325-1.472.76-1.536 1.442-.036.386.196.72.637.915.63.278 1.547.24 2.658-.11.666-.21 1.418-.517 2.215-.517.784 0 1.53.303 2.195.513 1.12.353 2.045.39 2.68.108.438-.194.67-.527.633-.913-.064-.68-.905-1.116-1.535-1.44-.426-.22-.782-.408-.83-.69-.026-.164.05-.314.212-.401.95-.513 2.204-.74 3.328-.948.244-.045.426-.253.441-.503.015-.252-.15-.474-.395-.534-1.585-.39-2.596-.78-3.088-1.127-.11-.077-.185-.155-.225-.234-.217-.427-.283-.803-.133-.957.088-.09.28-.119.526-.155.413-.06.963-.166 1.03-.498.02-.101.122-.194.287-.213.464-.053 1.072-.194 1.57-.47.594-.33 1.01-.83 1.01-1.487-.01-1.022-.93-1.655-2.007-2.072-.217-.084-.407-.182-.48-.312-.064-.115-.038-.253.042-.441.259-.605.42-1.405.42-2.015C17.388 4.193 15.139 2 12.003 2z" />
+          </svg>
+          <span className="text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
+            Snapchat
+          </span>
+          <span className="h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
+          <span className="text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
+            Spotlight · Public Videos · Stories
+          </span>
+        </div>
+
+        {/* TikTok Pill */}
+        <div className="inline-flex flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-full border border-teal-500/20 bg-teal-500/5 px-2.5 sm:px-3 py-1 sm:py-1.5 h-[38px] sm:h-[42px] max-h-[44px] transition-all hover:border-teal-500/35 hover:bg-teal-500/10 dark:border-teal-400/25 dark:bg-teal-500/10 shadow-sm whitespace-nowrap w-fit">
+          <svg
+            className="h-[20px] w-[20px] sm:h-[22px] sm:w-[22px] shrink-0 text-teal-600 dark:text-teal-400"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-5.2 1.74 2.89 2.89 0 0 1 2.31-4.64c.298-.002.595.042.88.13V9.4a6.84 6.84 0 0 0-1-.05A6.33 6.33 0 0 0 5 20.1a6.34 6.34 0 0 0 10.86-4.43v-7a8.16 8.16 0 0 0 4.77 1.52v-3.4a4.85 4.85 0 0 1-1.04-.1z" />
+          </svg>
+          <span className="text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
+            TikTok
+          </span>
+          <span className="h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
+          <span className="text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
+            Videos · Public Content
+          </span>
+        </div>
+
+        {/* X / Twitter Pill */}
+        <div className="inline-flex flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-full border border-slate-500/20 bg-slate-500/5 px-2.5 sm:px-3 py-1 sm:py-1.5 h-[38px] sm:h-[42px] max-h-[44px] transition-all hover:border-slate-500/35 hover:bg-slate-500/10 dark:border-slate-400/25 dark:bg-slate-500/10 shadow-sm whitespace-nowrap w-fit">
+          <svg
+            className="h-[18px] w-[18px] sm:h-[20px] sm:w-[20px] shrink-0 text-slate-900 dark:text-white"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+          </svg>
+          <span className="text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
+            X / Twitter
+          </span>
+          <span className="h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
+          <span className="text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
+            Posts · Videos · Images
+          </span>
+        </div>
+
+        {/* YouTube Pill */}
+        <div className="inline-flex flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-full border border-red-500/20 bg-red-500/5 px-2.5 sm:px-3 py-1 sm:py-1.5 h-[38px] sm:h-[42px] max-h-[44px] transition-all hover:border-red-500/35 hover:bg-red-500/10 dark:border-red-400/25 dark:bg-red-500/10 shadow-sm whitespace-nowrap w-fit">
+          <svg
+            className="h-[20px] w-[20px] sm:h-[22px] sm:w-[22px] shrink-0 text-red-600 dark:text-red-500"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+          </svg>
+          <span className="text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
+            YouTube
+          </span>
+          <span className="h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
+          <span className="text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
+            Videos · Shorts
           </span>
         </div>
       </div>

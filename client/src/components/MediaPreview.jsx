@@ -15,16 +15,25 @@ function formatDuration(seconds) {
 function getPlatformTypeLabel(platform, type, isHighlight) {
   let pName = 'Instagram';
   if (platform === 'facebook') pName = 'Facebook';
+  else if (platform === 'snapchat') pName = 'Snapchat';
+  else if (platform === 'tiktok') pName = 'TikTok';
+  else if (platform === 'twitter' || platform === 'x') pName = 'X';
+  else if (platform === 'youtube') pName = 'YouTube';
   else if (platform === 'public-media' || platform === 'public') pName = 'Public Media';
   else if (platform) pName = platform.charAt(0).toUpperCase() + platform.slice(1);
 
   let tName = 'Video';
   if (type === 'reel') tName = 'Reel';
+  else if (type === 'spotlight') tName = 'Spotlight';
+  else if (type === 'short' || type === 'shorts') tName = 'Short';
   else if (type === 'image' || type === 'photo') tName = 'Photo';
   else if (type === 'story') tName = 'Story';
   else if (type === 'video') tName = 'Video';
 
   if (isHighlight) {
+    if (platform === 'twitter' || platform === 'x') {
+      return `${pName} · Post · ${tName}`;
+    }
     return `${pName} · Highlight · ${tName}`;
   }
   return `${pName} · ${tName}`;

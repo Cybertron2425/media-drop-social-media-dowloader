@@ -1,15 +1,23 @@
 import { InstagramAdapter } from './instagram.js';
 import { FacebookAdapter } from './facebook.js';
+import { SnapchatAdapter } from './snapchat.js';
+import { TikTokAdapter } from './tiktok.js';
+import { TwitterAdapter } from './twitter.js';
+import { YouTubeAdapter } from './youtube.js';
 import { PublicMediaAdapter } from './publicMedia.js';
 
 /**
  * Platform registry:
- * - Dedicated adapters: Instagram and Facebook
+ * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, and YouTube
  * - Generic adapter: PublicMediaAdapter for legitimate third-party public media
  */
 const adapters = [
   new InstagramAdapter(),
   new FacebookAdapter(),
+  new SnapchatAdapter(),
+  new TikTokAdapter(),
+  new TwitterAdapter(),
+  new YouTubeAdapter(),
   new PublicMediaAdapter(),
 ];
 
