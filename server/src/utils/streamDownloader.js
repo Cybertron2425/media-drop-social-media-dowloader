@@ -11,16 +11,30 @@ export async function downloadStream(url, options = {}) {
   const parsed = await assertSafeUrl(targetUrl);
   const customHeaders = options.meta?.headers || {};
 
-  const response = await axios.get(targetUrl, {
-    responseType: 'stream',
-    timeout: 15000,
-    maxRedirects: 3,
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-      ...customHeaders,
-    },
-  });
+  let response;
+  try {
+    response = await axios.get(targetUrl, {
+      responseType: 'stream',
+      timeout: 15000,
+      maxRedirects: 3,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        ...customHeaders,
+      },
+    });
+  } catch (err) {
+    if (
+      err.response?.status === 403 ||
+      err.response?.status === 404 ||
+      err.response?.status === 410 ||
+      err.code === 'ECONNREFUSED' ||
+      err.code === 'ENOTFOUND'
+    ) {
+      throw new Error('This video cannot be downloaded from this source.');
+    }
+    throw err;
+  }
 
   const ext = parsed.pathname.split('.').pop()?.toLowerCase() || 'bin';
   const filename = decodeURIComponent(parsed.pathname.split('/').pop() || `download.${ext}`);

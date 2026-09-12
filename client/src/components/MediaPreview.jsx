@@ -13,7 +13,11 @@ function formatDuration(seconds) {
 }
 
 function getPlatformTypeLabel(platform, type, isHighlight) {
-  const pName = platform ? platform.charAt(0).toUpperCase() + platform.slice(1) : 'Instagram';
+  let pName = 'Instagram';
+  if (platform === 'facebook') pName = 'Facebook';
+  else if (platform === 'public-media' || platform === 'public') pName = 'Public Media';
+  else if (platform) pName = platform.charAt(0).toUpperCase() + platform.slice(1);
+
   let tName = 'Video';
   if (type === 'reel') tName = 'Reel';
   else if (type === 'image' || type === 'photo') tName = 'Photo';

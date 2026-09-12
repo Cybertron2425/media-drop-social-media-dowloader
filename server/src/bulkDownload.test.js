@@ -14,6 +14,11 @@ function makeRequest(server, options, bodyData = null) {
       {
         host: '127.0.0.1',
         port,
+        agent: false,
+        headers: {
+          'Connection': 'close',
+          ...(options.headers || {}),
+        },
         ...options,
       },
       (res) => {
@@ -50,6 +55,7 @@ test('Bulk Download Flow', async (t) => {
 
   t.after(() => {
     getAdapter('instagram').download = originalDownload;
+    if (server.closeAllConnections) server.closeAllConnections();
     return new Promise((resolve) => {
       server.close(resolve);
     });

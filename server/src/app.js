@@ -23,7 +23,11 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
-if (process.env.NODE_ENV !== 'test') {
+const isDirectRun =
+  process.argv[1] &&
+  (process.argv[1].endsWith('app.js') || process.argv[1].endsWith('app'));
+
+if (isDirectRun && process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     console.log(`MediaDrop server listening on port ${PORT}`);
   });

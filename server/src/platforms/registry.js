@@ -1,13 +1,16 @@
 import { InstagramAdapter } from './instagram.js';
 import { FacebookAdapter } from './facebook.js';
+import { PublicMediaAdapter } from './publicMedia.js';
 
 /**
- * Platform registry strictly supporting only Instagram and Facebook.
- * No other platform or fallback is registered.
+ * Platform registry:
+ * - Dedicated adapters: Instagram and Facebook
+ * - Generic adapter: PublicMediaAdapter for legitimate third-party public media
  */
 const adapters = [
   new InstagramAdapter(),
   new FacebookAdapter(),
+  new PublicMediaAdapter(),
 ];
 
 export function resolveAdapter(url) {

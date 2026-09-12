@@ -46,7 +46,7 @@ function sanitizeErrorMessage(msg) {
 export function validateDownloadHandler(req, res) {
   const token = peekDownloadToken(req.params.downloadId);
   if (!token) {
-    return res.status(404).json({ success: false, error: 'This download link has expired. Please analyze the media again.' });
+    return res.status(404).json({ success: false, error: 'The media is no longer available.' });
   }
   return res.json({ success: true });
 }
@@ -64,7 +64,7 @@ export async function prepareDownloadHandler(req, res) {
   const token = consumeDownloadToken(req.params.downloadId);
 
   if (!token) {
-    return res.status(404).json({ success: false, error: 'This download link has expired. Please analyze the media again.' });
+    return res.status(404).json({ success: false, error: 'The media is no longer available.' });
   }
 
   const adapter = getAdapter(token.platform) || resolveAdapter(token.sourceUrl || 'https://placeholder.invalid');
@@ -157,8 +157,8 @@ export async function prepareDownloadHandler(req, res) {
  */
 export function streamPreparedHandler(req, res) {
   const entry = consumePreparedFile(req.params.streamId);
-  if (!entry) {
-    return res.status(404).json({ success: false, error: 'This stream link has expired or is invalid. Please start the download again.' });
+  if (!entry || !fs.existsSync(entry.filePath)) {
+    return res.status(404).json({ success: false, error: 'The media is no longer available.' });
   }
 
   res.setHeader('Content-Type', entry.mimeType || 'application/octet-stream');
@@ -171,13 +171,11 @@ export function streamPreparedHandler(req, res) {
   fileStream.pipe(res);
 
   fileStream.on('end', () => {
-    fs.promises.unlink(entry.filePath).catch(() => {});
     logEvent({ operation: 'stream', success: true });
   });
 
   fileStream.on('error', (err) => {
     console.error('[Stream Handler] Read error:', err.message);
-    fs.promises.unlink(entry.filePath).catch(() => {});
     if (!res.headersSent) res.status(502).end();
   });
 }
@@ -192,7 +190,7 @@ async function streamDownload(downloadId, req, res) {
   const token = consumeDownloadToken(downloadId);
 
   if (!token) {
-    return res.status(404).json({ success: false, error: 'This download link has expired. Please analyze the media again.' });
+    return res.status(404).json({ success: false, error: 'The media is no longer available.' });
   }
 
   const adapter = getAdapter(token.platform) || resolveAdapter(token.sourceUrl || 'https://placeholder.invalid');
@@ -324,7 +322,7 @@ export async function bulkDownloadHandler(req, res) {
       await cleanup();
       return res.status(404).json({
         success: false,
-        error: 'This download link has expired. Please analyze the media again.',
+        error: 'The media is no longer available.',
       });
     }
 

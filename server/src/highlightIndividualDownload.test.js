@@ -14,6 +14,11 @@ function makeRequest(server, options, bodyData = null) {
       {
         host: '127.0.0.1',
         port,
+        agent: false,
+        headers: {
+          'Connection': 'close',
+          ...(options.headers || {}),
+        },
         ...options,
       },
       (res) => {
@@ -50,6 +55,7 @@ test('Instagram Highlight Individual & Bulk Downloads', async (t) => {
 
   t.after(() => {
     getAdapter('instagram').download = originalDownload;
+    if (server.closeAllConnections) server.closeAllConnections();
     return new Promise((resolve) => {
       server.close(resolve);
     });
@@ -158,6 +164,6 @@ test('Instagram Highlight Individual & Bulk Downloads', async (t) => {
     assert.equal(res.statusCode, 404);
     const data = res.json();
     assert.equal(data.success, false);
-    assert.match(data.error, /expired/i);
+    assert.match(data.error, /expired|no longer available/i);
   });
 });

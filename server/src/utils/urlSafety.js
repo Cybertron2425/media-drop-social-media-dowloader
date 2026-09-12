@@ -80,7 +80,7 @@ export async function assertSafeUrl(rawUrl) {
   try {
     addresses = await dns.lookup(hostname, { all: true, verbatim: true });
   } catch {
-    throw new Error('The media is no longer available.');
+    throw new Error('This video cannot be downloaded from this source.');
   }
 
   for (const { address, family } of addresses) {

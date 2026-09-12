@@ -4,13 +4,26 @@ import { BaseAdapter, PlatformLimitationError } from './baseAdapter.js';
 import { assertSafeUrl } from '../utils/urlSafety.js';
 import { downloadStream } from '../utils/streamDownloader.js';
 
-const FB_HOSTS = ['facebook.com', 'fb.watch', 'm.facebook.com', 'web.facebook.com'];
+const FB_HOSTS = ['facebook.com', 'fb.watch', 'fb.com', 'm.facebook.com', 'web.facebook.com'];
 
 const BROWSER_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   'Accept':
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+const MOBILE_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
   'Sec-Fetch-Dest': 'document',
   'Sec-Fetch-Mode': 'navigate',
@@ -37,7 +50,7 @@ export class FacebookAdapter extends BaseAdapter {
 
     let targetUrl = url;
 
-    // Follow redirects for shortlinks (e.g. fb.watch) using browser navigation headers
+    // Follow redirects for shortlinks and share links using browser navigation headers
     try {
       const headRes = await axios.head(url, {
         maxRedirects: 5,
@@ -53,6 +66,25 @@ export class FacebookAdapter extends BaseAdapter {
       // Continue with targetUrl if HEAD fails
     }
 
+    // If targetUrl did not redirect or is still a share link, try a GET redirect probe
+    if (targetUrl === url && /(?:\/share\/|fb\.watch)/i.test(url)) {
+      try {
+        const getProbe = await axios.get(url, {
+          maxRedirects: 5,
+          timeout: 8000,
+          headers: MOBILE_HEADERS,
+          validateStatus: (s) => s >= 200 && s < 400,
+        });
+        const resolved = getProbe.request?.res?.responseUrl;
+        if (resolved) {
+          await assertSafeUrl(resolved);
+          targetUrl = resolved;
+        }
+      } catch {
+        // Continue with targetUrl
+      }
+    }
+
     // Reject Facebook Stories
     if (/(?:stories)\//i.test(targetUrl) || /(?:stories)\//i.test(url)) {
       throw new PlatformLimitationError('Facebook Stories are currently not supported.');
@@ -60,9 +92,18 @@ export class FacebookAdapter extends BaseAdapter {
 
     // Extraction strategy: evaluate legitimate public surfaces in order
     const surfaces = [
-      { name: 'direct', url: targetUrl },
-      { name: 'mobile', url: targetUrl.replace('://www.facebook.com', '://m.facebook.com') },
-      { name: 'plugin', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(targetUrl)}` },
+      // 1. Official Facebook video plugin (primary for Reels and native video posts)
+      { name: 'plugin_target', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(targetUrl)}`, headers: BROWSER_HEADERS },
+      // 2. Mobile web with mobile headers (handles public Posts, photos, videos, shares)
+      { name: 'mobile_target', url: targetUrl, headers: MOBILE_HEADERS },
+      // 3. Mobile direct on original url if different
+      ...(targetUrl !== url ? [{ name: 'mobile_orig', url, headers: MOBILE_HEADERS }] : []),
+      // 4. Mobile subdomain m.facebook.com
+      { name: 'mobile_m', url: targetUrl.replace('://www.facebook.com', '://m.facebook.com').replace('://web.facebook.com', '://m.facebook.com'), headers: MOBILE_HEADERS },
+      // 5. Plugin on original url if different
+      ...(targetUrl !== url ? [{ name: 'plugin_orig', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(url)}`, headers: BROWSER_HEADERS }] : []),
+      // 6. Direct desktop web
+      { name: 'direct', url: targetUrl, headers: BROWSER_HEADERS },
     ];
 
     let extractedData = null;
@@ -75,7 +116,7 @@ export class FacebookAdapter extends BaseAdapter {
         const res = await axios.get(surface.url, {
           timeout: 10000,
           maxRedirects: 5,
-          headers: BROWSER_HEADERS,
+          headers: surface.headers || BROWSER_HEADERS,
           validateStatus: () => true,
         });
 
@@ -102,13 +143,20 @@ export class FacebookAdapter extends BaseAdapter {
 
         const title =
           $('meta[property="og:title"]').attr('content') ||
+          $('meta[name="twitter:title"]').attr('content') ||
           $('title').text()?.trim() ||
-          'Facebook Video';
+          'Facebook Post';
 
         const thumbnail =
           $('meta[property="og:image"]').attr('content') ||
           $('meta[property="og:image:url"]').attr('content') ||
+          $('meta[name="twitter:image"]').attr('content') ||
           null;
+
+        const canonical =
+          $('link[rel="canonical"]').attr('href') ||
+          $('meta[property="og:url"]').attr('content') ||
+          targetUrl;
 
         // Multi-level unescaping of slashes and unicode
         const cleaned = html
@@ -173,21 +221,31 @@ export class FacebookAdapter extends BaseAdapter {
 
         if (hdUrl || sdUrl) {
           extractedData = {
-            title,
+            title: title || 'Facebook Video',
             thumbnail,
             hdUrl,
             sdUrl,
             surface: surface.name,
+            canonical,
           };
           break;
         }
 
-        if (thumbnail && (/(?:photo|photos)/i.test(targetUrl) || /(?:photo|photos)/i.test(url))) {
+        // Photo / image post fallback
+        const isPhotoContext =
+          /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts|share)/i.test(canonical) ||
+          /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts|share)/i.test(targetUrl) ||
+          /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts|share)/i.test(url) ||
+          $('meta[property="og:type"]').attr('content') === 'article' ||
+          $('meta[property="og:type"]').attr('content') === 'photo';
+
+        if (thumbnail && isPhotoContext && thumbnail.startsWith('http')) {
           extractedData = {
             title: title || 'Facebook Photo',
             thumbnail,
             imageUrl: thumbnail,
             surface: surface.name,
+            canonical,
           };
           break;
         }

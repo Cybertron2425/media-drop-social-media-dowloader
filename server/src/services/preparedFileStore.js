@@ -23,13 +23,14 @@ export function storePreparedFile({ filePath, filename, mimeType, sizeBytes }) {
       store.delete(streamId);
       fs.promises.unlink(entry.filePath).catch(() => {});
     }
-  }, TTL_MS);
+  }, TTL_MS).unref();
 
   return streamId;
 }
 
 /**
- * Retrieves and removes a prepared file entry (single-use).
+ * Retrieves a prepared file entry.
+ * Remains valid for the configured TTL so the user can re-download.
  * Returns null if the token is unknown or expired.
  * @param {string} streamId
  * @returns {{ filePath: string, filename: string, mimeType: string, sizeBytes: number|null } | null}
@@ -42,7 +43,7 @@ export function consumePreparedFile(streamId) {
     fs.promises.unlink(entry.filePath).catch(() => {});
     return null;
   }
-  store.delete(streamId);
+  // Keep entry active during the session TTL so repeat downloads succeed
   return entry;
 }
 
@@ -57,4 +58,15 @@ export function peekPreparedFile(streamId) {
   if (Date.now() > entry.expiresAt) return null;
   return entry;
 }
+
+// Periodic cleanup of expired prepared files
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of store) {
+    if (now > entry.expiresAt) {
+      store.delete(id);
+      fs.promises.unlink(entry.filePath).catch(() => {});
+    }
+  }
+}, 60 * 1000).unref();
 
