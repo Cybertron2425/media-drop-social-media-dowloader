@@ -45,3 +45,16 @@ export function consumePreparedFile(streamId) {
   store.delete(streamId);
   return entry;
 }
+
+/**
+ * Read-only check to inspect a prepared file entry without consuming it.
+ * @param {string} streamId
+ * @returns {object|null}
+ */
+export function peekPreparedFile(streamId) {
+  const entry = store.get(streamId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) return null;
+  return entry;
+}
+

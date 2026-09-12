@@ -49,10 +49,8 @@ export default function App() {
     setDownloadError('');
     try {
       await downloadFormat(downloadId, setDownloadStage);
-      setTimeout(() => {
-        setDownloadingId(null);
-        setDownloadStage(null);
-      }, 2500);
+      setDownloadingId(null);
+      setDownloadStage(null);
     } catch (err) {
       setDownloadError(err.message);
       setDownloadingId(null);

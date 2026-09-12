@@ -19,7 +19,8 @@ export function consumeDownloadToken(id) {
     tokens.delete(id);
     return null;
   }
-  tokens.delete(id); // single-use: consuming always invalidates the token
+  // Tokens remain valid during their 15-minute TTL to support multiple legitimate
+  // downloads from an analyzed Highlight, re-downloads, and bulk ZIP bundling.
   return entry;
 }
 
