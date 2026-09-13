@@ -3,13 +3,18 @@ import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 import { nanoid } from 'nanoid';
-import { Innertube, ClientType, Platform } from 'youtubei.js';
+import { Innertube, ClientType, Platform, Constants } from 'youtubei.js';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import { assertSafeUrl } from '../utils/urlSafety.js';
 import { BaseAdapter, PlatformLimitationError } from './baseAdapter.js';
 
 // Configure JS evaluator for youtubei.js decipher engine
 Platform.shim.eval = async (data) => new Function(data.output)();
+
+// Use youtubei.googleapis.com as the InnerTube production API endpoint
+if (Constants?.URLS?.API?.PRODUCTION_2) {
+  Constants.URLS.API.PRODUCTION_1 = Constants.URLS.API.PRODUCTION_2;
+}
 
 let visionInnertube = null;
 let mwebInnertube = null;
