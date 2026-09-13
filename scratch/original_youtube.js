@@ -11,20 +11,12 @@ import { BaseAdapter, PlatformLimitationError } from './baseAdapter.js';
 // Configure JS evaluator for youtubei.js decipher engine
 Platform.shim.eval = async (data) => new Function(data.output)();
 
-let visionInnertube = null;
-let mwebInnertube = null;
-
-async function getInnertube(clientType = ClientType.VISIONOS) {
-  if (clientType === ClientType.VISIONOS) {
-    if (!visionInnertube) {
-      visionInnertube = await Innertube.create({ client_type: ClientType.VISIONOS });
-    }
-    return visionInnertube;
+let innertubeInstance = null;
+async function getInnertube() {
+  if (!innertubeInstance) {
+    innertubeInstance = await Innertube.create({ client_type: ClientType.MWEB });
   }
-  if (!mwebInnertube) {
-    mwebInnertube = await Innertube.create({ client_type: ClientType.MWEB });
-  }
-  return mwebInnertube;
+  return innertubeInstance;
 }
 
 const MAX_FILE_SIZE_BYTES = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 500) * 1024 * 1024;
@@ -134,45 +126,21 @@ export class YouTubeAdapter extends BaseAdapter {
       throw new PlatformLimitationError('Please enter a valid public YouTube video URL.');
     }
 
-    let yt = await getInnertube(ClientType.VISIONOS);
-    let info = null;
-    let clientUsed = ClientType.VISIONOS;
+    const yt = await getInnertube();
+    let info;
 
     try {
       info = await yt.getBasicInfo(videoId);
-    } catch {
-      info = null;
-    }
-
-    let allFormats = [
-      ...(info?.streaming_data?.formats || []),
-      ...(info?.streaming_data?.adaptive_formats || []),
-    ];
-    let videoFormats = allFormats.filter((f) => f.has_video && (f.url || f.signature_cipher || f.cipher));
-
-    // Fallback to MWEB if VISIONOS returned no playable formats (e.g. certain Shorts or regional limitations)
-    if (videoFormats.length === 0) {
-      yt = await getInnertube(ClientType.MWEB);
-      clientUsed = ClientType.MWEB;
-      try {
-        info = await yt.getBasicInfo(videoId);
-      } catch (err) {
-        console.error(`[YouTube Adapter] Failed to get video info for ${videoId}:`, err.message);
-        if (err.message?.includes('Video unavailable') || err.message?.includes('not found')) {
-          throw new PlatformLimitationError('This YouTube video is unavailable or has been removed.');
-        }
-        throw new PlatformLimitationError('Unable to access this YouTube video. It may be restricted or unavailable.');
+    } catch (err) {
+      console.error(`[YouTube Adapter] Failed to get video info for ${videoId}:`, err.message);
+      if (err.message?.includes('Video unavailable') || err.message?.includes('not found')) {
+        throw new PlatformLimitationError('This YouTube video is unavailable or has been removed.');
       }
-
-      allFormats = [
-        ...(info?.streaming_data?.formats || []),
-        ...(info?.streaming_data?.adaptive_formats || []),
-      ];
-      videoFormats = allFormats.filter((f) => f.has_video && (f.url || f.signature_cipher || f.cipher));
+      throw new PlatformLimitationError('Unable to access this YouTube video. It may be restricted or unavailable.');
     }
 
     // Check playability status
-    const playStatus = info?.playability_status?.status;
+    const playStatus = info.playability_status?.status;
     if (playStatus && playStatus !== 'OK') {
       const reason = info.playability_status?.reason || '';
       console.warn(`[YouTube Adapter] Video ${videoId} playability status: ${playStatus} - ${reason}`);
@@ -197,7 +165,7 @@ export class YouTubeAdapter extends BaseAdapter {
       );
     }
 
-    const basic = info?.basic_info || {};
+    const basic = info.basic_info || {};
     const title = basic.title || 'YouTube Video';
     const author = basic.author || '';
     const duration = basic.duration || 0;
@@ -218,6 +186,12 @@ export class YouTubeAdapter extends BaseAdapter {
       url.includes('/shorts/') ||
       (duration > 0 && duration <= 60 && basic.aspect_ratio && basic.aspect_ratio < 1);
 
+    const allFormats = [
+      ...(info.streaming_data?.formats || []),
+      ...(info.streaming_data?.adaptive_formats || []),
+    ];
+
+    const videoFormats = allFormats.filter((f) => f.has_video && (f.url || f.signature_cipher || f.cipher));
     const audioFormats = allFormats.filter((f) => f.has_audio && !f.has_video && (f.url || f.signature_cipher || f.cipher));
 
     if (videoFormats.length === 0) {
@@ -321,8 +295,6 @@ export class YouTubeAdapter extends BaseAdapter {
           fps: fmt.fps,
           quality: displayQuality,
           title,
-          duration,
-          clientType: clientUsed,
         },
       };
     });
@@ -352,12 +324,11 @@ export class YouTubeAdapter extends BaseAdapter {
       throw new PlatformLimitationError('Please provide a valid YouTube video URL.');
     }
 
-    const clientType = options.meta?.clientType || ClientType.VISIONOS;
-    let yt = await getInnertube(clientType);
-    let info = await yt.getBasicInfo(videoId).catch(() => null);
-    let allFormats = [
-      ...(info?.streaming_data?.formats || []),
-      ...(info?.streaming_data?.adaptive_formats || []),
+    const yt = await getInnertube();
+    const info = await yt.getBasicInfo(videoId);
+    const allFormats = [
+      ...(info.streaming_data?.formats || []),
+      ...(info.streaming_data?.adaptive_formats || []),
     ];
 
     const requestedVideoItag = options.meta?.videoItag;
@@ -367,20 +338,6 @@ export class YouTubeAdapter extends BaseAdapter {
     let videoFmt = null;
     if (requestedVideoItag) {
       videoFmt = allFormats.find((f) => f.itag === Number(requestedVideoItag));
-    }
-
-    // Fallback to alternate client if requested format is not in current client's streaming data
-    if (!videoFmt) {
-      const fallbackClient = clientType === ClientType.VISIONOS ? ClientType.MWEB : ClientType.VISIONOS;
-      yt = await getInnertube(fallbackClient);
-      info = await yt.getBasicInfo(videoId);
-      allFormats = [
-        ...(info?.streaming_data?.formats || []),
-        ...(info?.streaming_data?.adaptive_formats || []),
-      ];
-      if (requestedVideoItag) {
-        videoFmt = allFormats.find((f) => f.itag === Number(requestedVideoItag));
-      }
     }
     if (!videoFmt) {
       const videoFormats = allFormats.filter((f) => f.has_video && (f.url || f.signature_cipher || f.cipher));
@@ -473,13 +430,10 @@ export class YouTubeAdapter extends BaseAdapter {
   }
 
   async #downloadStreamToFile(url, contentLength, targetPath) {
-    let totalLength = contentLength ? Number(contentLength) : null;
+    const totalLength = contentLength ? Number(contentLength) : null;
     const writeStream = fs.createWriteStream(targetPath);
     let bytesWritten = 0;
 
-    // Mobile Safari UA is required — YouTube CDN applies stricter throttling and
-    // connection termination for desktop Chrome UA on automated Range requests,
-    // which causes WSACONNABORTED (wsarecv) errors on Windows.
     const headers = {
       'User-Agent':
         'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
@@ -487,158 +441,69 @@ export class YouTubeAdapter extends BaseAdapter {
       'Origin': 'https://www.youtube.com',
     };
 
-    // Step 1: Try a direct (un-ranged) fetch first.
-    // For many YouTube streams this returns the complete body in one response — no AbortController,
-    // no Range header, no WSACONNABORTED risk.  This is the primary happy path.
-    try {
-      const directRes = await fetch(url, { headers });
-      if (directRes.ok) {
-        return await new Promise((resolve, reject) => {
-          directRes.body
-            .pipeTo(
-              new WritableStream({
-                write(chunk) {
-                  bytesWritten += chunk.length;
-                  if (bytesWritten > MAX_FILE_SIZE_BYTES) {
-                    writeStream.destroy();
-                    throw new PlatformLimitationError('This video exceeds the maximum allowed download size.');
-                  }
-                  writeStream.write(chunk);
-                },
-                close() {
-                  writeStream.end(resolve);
-                },
-                abort(err) {
+    // 1. Try direct streaming fetch with mobile browser headers
+    let res = await fetch(url, { headers });
+    if (res.ok) {
+      return new Promise((resolve, reject) => {
+        res.body
+          .pipeTo(
+            new WritableStream({
+              write(chunk) {
+                bytesWritten += chunk.length;
+                if (bytesWritten > MAX_FILE_SIZE_BYTES) {
                   writeStream.destroy();
-                  reject(err);
-                },
-              })
-            )
-            .catch(reject);
-        });
-      }
-      // Non-OK status — fall through to chunked Range approach below
-    } catch {
-      // Direct fetch failed (network error, throttle, etc.) — fall through to Range chunking
+                  throw new Error('This video exceeds the maximum allowed download size.');
+                }
+                writeStream.write(chunk);
+              },
+              close() {
+                writeStream.end(resolve);
+              },
+              abort(err) {
+                writeStream.destroy();
+                reject(err);
+              },
+            })
+          )
+          .catch(reject);
+      });
     }
 
-    // Step 2: Fallback — chunked Range download using 2MB slices.
-    // YouTube googlevideo CDN URLs have a ~4MB upstream Range slice limit.
-    // 2MB chunks stay comfortably within that limit while keeping throughput high.
-    const CHUNK_SIZE = 2 * 1024 * 1024;
+    // 2. Fallback: chunked Range download using safe 1MB slices
+    const CHUNK_SIZE = 1024 * 1024;
     let start = 0;
-
-    const STALL_TIMEOUT_MS = 45000; // 45 seconds idle stall per chunk
-
-    try {
-      while (totalLength === null || start < totalLength) {
-        const end = totalLength !== null ? Math.min(start + CHUNK_SIZE - 1, totalLength - 1) : start + CHUNK_SIZE - 1;
-
-        let chunkRes = null;
-        let lastErr = null;
-
-        // Retry each chunk up to 3 times on transient network hiccups
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            const controller = new AbortController();
-            let stallTimer = setTimeout(() => controller.abort(), STALL_TIMEOUT_MS);
-
-            chunkRes = await fetch(url, {
-              headers: {
-                ...headers,
-                'Range': `bytes=${start}-${end}`,
-              },
-              signal: controller.signal,
-            });
-
-            if (!chunkRes.ok) {
-              clearTimeout(stallTimer);
-              if ((chunkRes.status === 416 || chunkRes.status === 403) && bytesWritten > 0) {
-                // Range Not Satisfiable or Forbidden after data received — treat as end of stream
-                break;
-              }
-              throw new Error(`Upstream YouTube CDN returned status ${chunkRes.status}`);
-            }
-
-            // Extract total content length from Content-Range if not known in advance
-            if (totalLength === null) {
-              const contentRange = chunkRes.headers.get('content-range');
-              if (contentRange) {
-                const match = contentRange.match(/\/(\d+)/);
-                if (match) totalLength = parseInt(match[1], 10);
-              }
-              if (totalLength === null && chunkRes.status === 200) {
-                const cl = chunkRes.headers.get('content-length');
-                if (cl) totalLength = parseInt(cl, 10);
-              }
-            }
-
-            for await (const chunk of chunkRes.body) {
-              clearTimeout(stallTimer);
-              stallTimer = setTimeout(() => controller.abort(), STALL_TIMEOUT_MS);
-
-              bytesWritten += chunk.length;
-              if (bytesWritten > MAX_FILE_SIZE_BYTES) {
-                clearTimeout(stallTimer);
-                writeStream.destroy();
-                throw new PlatformLimitationError('This video exceeds the maximum allowed download size.');
-              }
-              writeStream.write(chunk);
-            }
-
-            clearTimeout(stallTimer);
-            lastErr = null;
-            break; // Chunk succeeded
-          } catch (err) {
-            lastErr = err;
-            if (attempt < 3) {
-              await new Promise((r) => setTimeout(r, 500 * attempt));
-            }
-          }
-        }
-
-        if (lastErr) {
-          writeStream.destroy();
-          throw new PlatformLimitationError(`Failed to stream media chunk from YouTube (${lastErr.message})`);
-        }
-
-        if ((chunkRes?.status === 416 || chunkRes?.status === 403) && bytesWritten > 0) {
-          break;
-        }
-
-        // Advance start offset using bytes written to ensure zero overlap and zero gaps
-        start = bytesWritten;
-
-        // If the server responded 200 OK (no Range support) — single-response body complete
-        if (chunkRes?.status === 200) {
-          break;
-        }
-
-        if (totalLength !== null && bytesWritten >= totalLength) {
-          break;
-        }
-      }
-
-      if (bytesWritten === 0) {
-        throw new PlatformLimitationError('No media data was received from YouTube.');
-      }
-
-      if (totalLength !== null && bytesWritten < totalLength) {
-        throw new PlatformLimitationError(
-          `Video download was truncated: received ${bytesWritten} of ${totalLength} bytes.`
-        );
-      }
-
-      await new Promise((resolve, reject) => {
-        writeStream.end(resolve);
-        writeStream.on('error', reject);
+    while (!totalLength || start < totalLength) {
+      const end = totalLength ? Math.min(start + CHUNK_SIZE - 1, totalLength - 1) : start + CHUNK_SIZE - 1;
+      const chunkRes = await fetch(url, {
+        headers: {
+          ...headers,
+          'Range': `bytes=${start}-${end}`,
+        },
       });
 
-      return bytesWritten;
-    } catch (err) {
-      writeStream.destroy();
-      throw err;
+      if (!chunkRes.ok) {
+        if ((chunkRes.status === 416 || chunkRes.status === 403) && bytesWritten > 0) {
+          // Reached end of stream
+          break;
+        }
+        writeStream.destroy();
+        throw new Error(`Upstream stream request failed with status ${chunkRes.status}`);
+      }
+
+      for await (const chunk of chunkRes.body) {
+        bytesWritten += chunk.length;
+        if (bytesWritten > MAX_FILE_SIZE_BYTES) {
+          writeStream.destroy();
+          throw new Error('This video exceeds the maximum allowed download size.');
+        }
+        writeStream.write(chunk);
+      }
+
+      if (totalLength && end >= totalLength - 1) break;
+      start = end + 1;
     }
+
+    return new Promise((resolve) => writeStream.end(resolve));
   }
 
   async #muxMedia(videoPath, audioPath, outputPath, videoFmt, audioFmt) {

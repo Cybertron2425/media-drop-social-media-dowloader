@@ -181,7 +181,7 @@ functionality mat banao" — isi liye ye approach li gayi hai.
 PORT=5000
 CLIENT_URL=http://localhost:5173
 
-MAX_FILE_SIZE_MB=500
+MAX_FILE_SIZE_MB=2048
 MAX_DOWNLOAD_TIME_SECONDS=300
 
 RATE_LIMIT_ANALYZE=10

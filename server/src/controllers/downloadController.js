@@ -7,7 +7,9 @@ import { consumeDownloadToken, peekDownloadToken } from '../services/downloadTok
 import { storePreparedFile, consumePreparedFile } from '../services/preparedFileStore.js';
 import { getAdapter, resolveAdapter } from '../platforms/registry.js';
 import { PlatformLimitationError } from '../platforms/baseAdapter.js';
+import axios from 'axios';
 import { logEvent } from '../utils/logger.js';
+import { validateMediaFile } from '../utils/mediaValidator.js';
 
 const MAX_FILE_SIZE_BYTES = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 500) * 1024 * 1024;
 const MAX_DOWNLOAD_TIME_MS = (parseInt(process.env.MAX_DOWNLOAD_TIME_SECONDS, 10) || 300) * 1000;
@@ -43,12 +45,55 @@ function sanitizeErrorMessage(msg) {
  * Confirms a downloadId is still valid WITHOUT consuming it.
  * The frontend calls this first so it can show a clear error instead of a silent failure.
  */
-export function validateDownloadHandler(req, res) {
+export async function validateDownloadHandler(req, res) {
   const token = peekDownloadToken(req.params.downloadId);
   if (!token) {
     return res.status(404).json({ success: false, error: 'The media is no longer available.' });
   }
-  return res.json({ success: true });
+
+  // If size is already known and exceeds the configured limit, reject upfront
+  if (token.meta?.sizeBytes && token.meta.sizeBytes > MAX_FILE_SIZE_BYTES) {
+    return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+  }
+
+  // For adapters with direct media stream URLs (e.g. Pornhub), perform an upstream HEAD check
+  if (token.meta?.videoUrl && !token.meta.sizeBytes) {
+    try {
+      const headers = {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        ...(token.meta.headers || {}),
+      };
+      if (token.platform === 'pornhub' && !headers.Referer && !headers.referer) {
+        headers.Referer = 'https://www.pornhub.org/';
+      }
+
+      const headRes = await axios.head(token.meta.videoUrl, {
+        timeout: 4000,
+        headers,
+      });
+      const cl = headRes.headers['content-length'];
+      if (cl) {
+        const sizeBytes = parseInt(cl, 10);
+        token.meta.sizeBytes = sizeBytes;
+        if (sizeBytes > MAX_FILE_SIZE_BYTES) {
+          return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+        }
+      }
+    } catch {
+      // If HEAD check times out or fails, allow validation to pass; streamDownload will enforce limits during pipe
+    }
+  }
+
+  // Adaptive YouTube videos require server-side chunked Range fetching and FFmpeg muxing
+  // before serving. Other platforms and pre-muxed streams stream directly.
+  const requiresPrepare = token.platform === 'youtube' && !!token.meta?.audioItag;
+
+  return res.json({
+    success: true,
+    platform: token.platform,
+    requiresPrepare,
+  });
 }
 
 /**
@@ -87,6 +132,14 @@ export async function prepareDownloadHandler(req, res) {
 
     let filePath;
 
+    // Pre-stream size check: if the adapter already knows the file size (from
+    // Content-Length), reject immediately before wasting bandwidth or disk space.
+    if (result.sizeBytes && result.sizeBytes > MAX_FILE_SIZE_BYTES) {
+      result.stream?.destroy?.();
+      clearTimeout(timer);
+      return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+    }
+
     // If an adapter returns a pre-created temp file path, reuse it directly.
     if (result._tempFilePath) {
       filePath = result._tempFilePath;
@@ -115,10 +168,30 @@ export async function prepareDownloadHandler(req, res) {
     }
 
     const stat = await fs.promises.stat(filePath);
+    if (stat.size === 0) {
+      await fs.promises.unlink(filePath).catch(() => {});
+      clearTimeout(timer);
+      return res.status(502).json({ success: false, error: 'Downloaded file is empty. Please try again.' });
+    }
+
     if (stat.size > MAX_FILE_SIZE_BYTES) {
       await fs.promises.unlink(filePath).catch(() => {});
       clearTimeout(timer);
       return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+    }
+
+    // Verify media container and duration integrity
+    const validation = await validateMediaFile(filePath, {
+      duration: token.meta?.duration,
+    });
+    if (!validation.valid) {
+      await fs.promises.unlink(filePath).catch(() => {});
+      clearTimeout(timer);
+      console.error('[File Validation Error]:', validation.error);
+      return res.status(502).json({
+        success: false,
+        error: validation.error || 'The downloaded media file is corrupted or incomplete. Please try again.',
+      });
     }
 
     const streamId = storePreparedFile({
@@ -198,10 +271,18 @@ async function streamDownload(downloadId, req, res) {
     return res.status(400).json({ success: false, error: 'This platform is currently not supported.' });
   }
 
-  const timer = setTimeout(() => {
+  let stallTimer = setTimeout(() => {
     if (!res.headersSent) res.status(504).end();
     res.destroy();
   }, MAX_DOWNLOAD_TIME_MS);
+
+  const resetStallTimer = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      if (!res.headersSent) res.status(504).end();
+      res.destroy();
+    }, MAX_DOWNLOAD_TIME_MS);
+  };
 
   try {
     const result = await adapter.download(token.sourceUrl, {
@@ -211,7 +292,7 @@ async function streamDownload(downloadId, req, res) {
     });
 
     if (result.sizeBytes && result.sizeBytes > MAX_FILE_SIZE_BYTES) {
-      clearTimeout(timer);
+      clearTimeout(stallTimer);
       result.stream.destroy?.();
       return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
     }
@@ -223,8 +304,10 @@ async function streamDownload(downloadId, req, res) {
 
     let bytesStreamed = 0;
     result.stream.on('data', (chunk) => {
+      resetStallTimer();
       bytesStreamed += chunk.length;
       if (bytesStreamed > MAX_FILE_SIZE_BYTES) {
+        clearTimeout(stallTimer);
         result.stream.destroy();
         res.destroy();
       }
@@ -237,18 +320,19 @@ async function streamDownload(downloadId, req, res) {
       if (result._tempFilePath) {
         fs.promises.unlink(result._tempFilePath).catch(() => {});
       }
-      clearTimeout(timer);
+      clearTimeout(stallTimer);
       logEvent({ requestId: req.id, platform: token.platform, operation: 'download', durationMs: Date.now() - start, success: true });
     });
 
-    result.stream.on('error', () => {
+    result.stream.on('error', (err) => {
+      console.error('[Download Controller Stream Error]:', err?.message || err);
       if (result._tempFilePath) fs.promises.unlink(result._tempFilePath).catch(() => {});
-      clearTimeout(timer);
+      clearTimeout(stallTimer);
       if (!res.headersSent) res.status(502).json({ success: false, error: 'Something went wrong. Please try again.' });
       logEvent({ requestId: req.id, platform: token.platform, operation: 'download', durationMs: Date.now() - start, success: false });
     });
   } catch (err) {
-    clearTimeout(timer);
+    clearTimeout(stallTimer);
     console.error('[Download Controller Error]:', err);
     logEvent({ requestId: req.id, platform: token.platform, operation: 'download', durationMs: Date.now() - start, success: false });
 

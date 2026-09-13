@@ -18,62 +18,63 @@ export async function analyzeUrl(url) {
 }
 
 /**
- * Two-phase download flow with honest indeterminate status progression:
+ * Two-phase download flow:
  *
- * Phase 1 – Prepare (server-side): POST /download/:downloadId/prepare
- *   The server fetches public media streams, validates size and safety,
- *   and writes to a temporary stream file.
+ * Phase 1 — Prepare (POST /download/:downloadId/prepare):
+ *   Server performs all heavy work (fetch, FFmpeg mux for adaptive YouTube, etc.) and
+ *   writes the result to a temp file.  This may take several minutes for large 4K content.
+ *   The UI shows an honest "Processing…" spinner during this time.
  *
- * Phase 2 – Stream (browser): GET /stream/:streamId
- *   Triggers a native browser download directly from the prepared file.
+ * Phase 2 — Stream (GET /stream/:streamId):
+ *   Immediately returns response headers and streams the already-prepared file.
+ *   The browser's native download manager takes over from here, showing real progress.
+ *   No file content is ever buffered into JavaScript memory on the frontend.
+ *
+ * Why two phases?
+ *   For adaptive YouTube videos (normal videos with separate video+audio streams),
+ *   the server must download video chunks, download audio chunks, and mux them with
+ *   FFmpeg before a single byte can be served.  Doing all of this inline inside a
+ *   single GET request causes HTTP 504 timeouts for anything over ~2 minutes.
+ *   Shorts and other small/pre-muxed formats complete fast enough that the old
+ *   single-phase approach happened to work.  The two-phase approach works for all
+ *   content types and all sizes without any timeout risk.
  */
 export async function downloadFormat(downloadId, onStage) {
-  onStage?.('preparing');
+  onStage?.('starting');
 
-  // Progressive indeterminate status updates while awaiting server processing
-  const t1 = setTimeout(() => onStage?.('downloading'), 1000);
-  const t2 = setTimeout(() => onStage?.('processing'), 3000);
+  // Phase 1: Server-side prepare (download + mux).
+  // This may take several minutes for large adaptive YouTube videos — that is expected.
+  const prepareRes = await fetch(`${BASE}/download/${downloadId}/prepare`, {
+    method: 'POST',
+  });
 
-  try {
-    const prepareRes = await fetch(`${BASE}/download/${downloadId}/prepare`, {
-      method: 'POST',
-    });
+  const prepareData = await prepareRes.json().catch(() => ({}));
 
-    clearTimeout(t1);
-    clearTimeout(t2);
-
-    const data = await prepareRes.json().catch(() => ({}));
-    if (!prepareRes.ok || !data.success) {
-      throw new Error(data.error || 'Something went wrong. Please try again.');
-    }
-
-    const { streamId } = data;
-
-    // Fetch stream as blob so any HTTP/rate-limit error is caught in React instead of raw browser navigation
-    onStage?.('ready');
-    const streamRes = await fetch(`${BASE}/stream/${streamId}`);
-    if (!streamRes.ok) {
-      const errData = await streamRes.json().catch(() => ({}));
-      throw new Error(errData.error || 'Download failed. Please try again.');
-    }
-
-    const blob = await streamRes.blob();
-    const blobUrl = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.setAttribute('download', data.filename || 'download');
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(blobUrl);
-
-    onStage?.('complete');
-  } catch (err) {
-    clearTimeout(t1);
-    clearTimeout(t2);
-    throw err;
+  if (!prepareRes.ok || !prepareData.success) {
+    throw new Error(prepareData.error || 'Failed to prepare the download. Please try again.');
   }
+
+  const { streamId } = prepareData;
+  if (!streamId) {
+    throw new Error('Server did not return a valid stream token. Please try again.');
+  }
+
+  // Phase 2: Trigger native browser download using the ready-made stream.
+  // The server responds immediately with headers since the file is already prepared.
+  onStage?.('started');
+
+  const streamUrl = `${BASE}/stream/${streamId}`;
+  const a = document.createElement('a');
+  a.href = streamUrl;
+  a.setAttribute('download', '');
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+
+  // Brief confirmation display before resetting UI state
+  await new Promise((resolve) => setTimeout(resolve, 2500));
+  onStage?.('complete');
 }
 
 /**

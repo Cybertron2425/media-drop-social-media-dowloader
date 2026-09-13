@@ -33,9 +33,8 @@ router.post('/download/:downloadId/prepare', preparedDownloadLimiter, prepareDow
 router.get('/stream/:streamId', streamPreparedHandler);
 
 // ── Legacy single-step download endpoints ───────────────────────────────────
-// Kept for the documented API contract and non-browser API clients.
-router.get('/download/:downloadId/validate', downloadLimiter, validateDownloadHandler);
-router.get('/download/:downloadId', downloadLimiter, downloadStreamHandler);
+router.get('/download/:downloadId/validate', preparedDownloadLimiter, validateDownloadHandler);
+router.get('/download/:downloadId', preparedDownloadLimiter, downloadStreamHandler);
 router.post('/download', downloadLimiter, downloadHandler);
 
 export default router;

@@ -4,11 +4,12 @@ import { SnapchatAdapter } from './snapchat.js';
 import { TikTokAdapter } from './tiktok.js';
 import { TwitterAdapter } from './twitter.js';
 import { YouTubeAdapter } from './youtube.js';
+import { PornhubAdapter } from './pornhub.js';
 import { PublicMediaAdapter } from './publicMedia.js';
 
 /**
  * Platform registry:
- * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, and YouTube
+ * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, YouTube, and Pornhub
  * - Generic adapter: PublicMediaAdapter for legitimate third-party public media
  */
 const adapters = [
@@ -18,6 +19,7 @@ const adapters = [
   new TikTokAdapter(),
   new TwitterAdapter(),
   new YouTubeAdapter(),
+  new PornhubAdapter(),
   new PublicMediaAdapter(),
 ];
 

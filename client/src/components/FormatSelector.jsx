@@ -19,11 +19,9 @@ function Spinner() {
 }
 
 const STAGE_LABELS = {
-  preparing:   'Preparing...',
-  downloading: 'Downloading...',
-  processing:  'Processing...',
-  ready:       'Starting download...',
-  complete:    '✓ Download ready',
+  starting: 'Processing…',
+  started:  '✓ Download started',
+  complete: '✓ Download started',
 };
 
 export default function FormatSelector({ formats, mediaType, isHighlight, onDownload, downloadingId, downloadStage }) {
