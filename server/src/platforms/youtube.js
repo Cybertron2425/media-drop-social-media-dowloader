@@ -13,6 +13,8 @@ Platform.shim.eval = async (data) => new Function(data.output)();
 
 let visionInnertube = null;
 let mwebInnertube = null;
+let iosInnertube = null;
+let androidInnertube = null;
 
 async function getInnertube(clientType = ClientType.VISIONOS) {
   if (clientType === ClientType.VISIONOS) {
@@ -21,10 +23,25 @@ async function getInnertube(clientType = ClientType.VISIONOS) {
     }
     return visionInnertube;
   }
-  if (!mwebInnertube) {
-    mwebInnertube = await Innertube.create({ client_type: ClientType.MWEB });
+  if (clientType === ClientType.MWEB) {
+    if (!mwebInnertube) {
+      mwebInnertube = await Innertube.create({ client_type: ClientType.MWEB });
+    }
+    return mwebInnertube;
   }
-  return mwebInnertube;
+  if (clientType === ClientType.IOS) {
+    if (!iosInnertube) {
+      iosInnertube = await Innertube.create({ client_type: ClientType.IOS });
+    }
+    return iosInnertube;
+  }
+  if (clientType === ClientType.ANDROID) {
+    if (!androidInnertube) {
+      androidInnertube = await Innertube.create({ client_type: ClientType.ANDROID });
+    }
+    return androidInnertube;
+  }
+  return Innertube.create({ client_type: clientType });
 }
 
 const MAX_FILE_SIZE_BYTES = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 500) * 1024 * 1024;
@@ -134,41 +151,57 @@ export class YouTubeAdapter extends BaseAdapter {
       throw new PlatformLimitationError('Please enter a valid public YouTube video URL.');
     }
 
-    let yt = await getInnertube(ClientType.VISIONOS);
+    // Candidate clients in order: VISIONOS -> MWEB (existing working local path),
+    // followed by IOS -> ANDROID (datacenter/cloud fallbacks for Render)
+    const candidateClients = [
+      ClientType.VISIONOS,
+      ClientType.MWEB,
+      ClientType.IOS,
+      ClientType.ANDROID,
+    ];
+
+    let yt = null;
     let info = null;
     let clientUsed = ClientType.VISIONOS;
+    let allFormats = [];
+    let videoFormats = [];
+    let lastError = null;
 
-    try {
-      info = await yt.getBasicInfo(videoId);
-    } catch {
-      info = null;
+    for (const clientType of candidateClients) {
+      try {
+        const candidateYt = await getInnertube(clientType);
+        const candidateInfo = await candidateYt.getBasicInfo(videoId);
+        const candidateAll = [
+          ...(candidateInfo?.streaming_data?.formats || []),
+          ...(candidateInfo?.streaming_data?.adaptive_formats || []),
+        ];
+        const candidateVideo = candidateAll.filter(
+          (f) => f.has_video && (f.url || f.signature_cipher || f.cipher)
+        );
+
+        if (candidateVideo.length > 0) {
+          yt = candidateYt;
+          info = candidateInfo;
+          clientUsed = clientType;
+          allFormats = candidateAll;
+          videoFormats = candidateVideo;
+          lastError = null;
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+        console.warn(`[YouTube Adapter] Client ${clientType} failed for ${videoId}:`, err.message);
+      }
     }
 
-    let allFormats = [
-      ...(info?.streaming_data?.formats || []),
-      ...(info?.streaming_data?.adaptive_formats || []),
-    ];
-    let videoFormats = allFormats.filter((f) => f.has_video && (f.url || f.signature_cipher || f.cipher));
-
-    // Fallback to MWEB if VISIONOS returned no playable formats (e.g. certain Shorts or regional limitations)
     if (videoFormats.length === 0) {
-      yt = await getInnertube(ClientType.MWEB);
-      clientUsed = ClientType.MWEB;
-      try {
-        info = await yt.getBasicInfo(videoId);
-      } catch (err) {
-        console.error(`[YouTube Adapter] Failed to get video info for ${videoId}:`, err.message);
-        if (err.message?.includes('Video unavailable') || err.message?.includes('not found')) {
+      if (lastError) {
+        console.error(`[YouTube Adapter] Failed to get video info for ${videoId}:`, lastError.message);
+        if (lastError.message?.includes('Video unavailable') || lastError.message?.includes('not found')) {
           throw new PlatformLimitationError('This YouTube video is unavailable or has been removed.');
         }
-        throw new PlatformLimitationError('Unable to access this YouTube video. It may be restricted or unavailable.');
       }
-
-      allFormats = [
-        ...(info?.streaming_data?.formats || []),
-        ...(info?.streaming_data?.adaptive_formats || []),
-      ];
-      videoFormats = allFormats.filter((f) => f.has_video && (f.url || f.signature_cipher || f.cipher));
+      throw new PlatformLimitationError('Unable to access this YouTube video. It may be restricted or unavailable.');
     }
 
     // Check playability status
@@ -369,17 +402,37 @@ export class YouTubeAdapter extends BaseAdapter {
       videoFmt = allFormats.find((f) => f.itag === Number(requestedVideoItag));
     }
 
-    // Fallback to alternate client if requested format is not in current client's streaming data
+    // Fallback to alternate clients if requested format is not in current client's streaming data
     if (!videoFmt) {
-      const fallbackClient = clientType === ClientType.VISIONOS ? ClientType.MWEB : ClientType.VISIONOS;
-      yt = await getInnertube(fallbackClient);
-      info = await yt.getBasicInfo(videoId);
-      allFormats = [
-        ...(info?.streaming_data?.formats || []),
-        ...(info?.streaming_data?.adaptive_formats || []),
-      ];
-      if (requestedVideoItag) {
-        videoFmt = allFormats.find((f) => f.itag === Number(requestedVideoItag));
+      const fallbackClients = [
+        ClientType.VISIONOS,
+        ClientType.MWEB,
+        ClientType.IOS,
+        ClientType.ANDROID,
+      ].filter((c) => c !== clientType);
+
+      for (const fallbackClient of fallbackClients) {
+        try {
+          const fallbackYt = await getInnertube(fallbackClient);
+          const fallbackInfo = await fallbackYt.getBasicInfo(videoId);
+          const fallbackFormats = [
+            ...(fallbackInfo?.streaming_data?.formats || []),
+            ...(fallbackInfo?.streaming_data?.adaptive_formats || []),
+          ];
+          let matchedFmt = null;
+          if (requestedVideoItag) {
+            matchedFmt = fallbackFormats.find((f) => f.itag === Number(requestedVideoItag));
+          }
+          if (matchedFmt) {
+            yt = fallbackYt;
+            info = fallbackInfo;
+            allFormats = fallbackFormats;
+            videoFmt = matchedFmt;
+            break;
+          }
+        } catch {
+          // Continue to next fallback client
+        }
       }
     }
     if (!videoFmt) {
