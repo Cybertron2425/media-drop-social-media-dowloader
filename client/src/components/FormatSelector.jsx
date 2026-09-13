@@ -20,6 +20,7 @@ function Spinner() {
 
 const STAGE_LABELS = {
   starting: 'Processing…',
+  processing: 'Processing…',
   started:  '✓ Download started',
   complete: '✓ Download started',
 };

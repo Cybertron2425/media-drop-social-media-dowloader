@@ -85,9 +85,14 @@ export async function validateDownloadHandler(req, res) {
     }
   }
 
-  // Adaptive YouTube videos require server-side chunked Range fetching and FFmpeg muxing
-  // before serving. Other platforms and pre-muxed streams stream directly.
-  const requiresPrepare = token.platform === 'youtube' && !!token.meta?.audioItag;
+  // YouTube's download() method always writes the full file to disk before returning a
+  // stream (both pre-muxed formats and adaptive formats that need FFmpeg muxing).
+  // Routing YouTube through streamDownload() would block the HTTP response until the
+  // entire file is on the server's disk — the browser Download Manager would never see
+  // bytes until then.  The two-phase prepare→stream flow is correct for ALL YouTube
+  // formats: it shows an honest "Processing…" spinner, then immediately hands off to the
+  // browser's native Download Manager the instant the prepared file is ready.
+  const requiresPrepare = token.platform === 'youtube';
 
   return res.json({
     success: true,

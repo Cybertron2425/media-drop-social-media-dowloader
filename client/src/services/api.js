@@ -25,55 +25,65 @@ export async function analyzeUrl(url) {
  *   writes the result to a temp file.  This may take several minutes for large 4K content.
  *   The UI shows an honest "Processing…" spinner during this time.
  *
- * Phase 2 — Stream (GET /stream/:streamId):
- *   Immediately returns response headers and streams the already-prepared file.
- *   The browser's native download manager takes over from here, showing real progress.
- *   No file content is ever buffered into JavaScript memory on the frontend.
- *
- * Why two phases?
- *   For adaptive YouTube videos (normal videos with separate video+audio streams),
- *   the server must download video chunks, download audio chunks, and mux them with
- *   FFmpeg before a single byte can be served.  Doing all of this inline inside a
- *   single GET request causes HTTP 504 timeouts for anything over ~2 minutes.
- *   Shorts and other small/pre-muxed formats complete fast enough that the old
- *   single-phase approach happened to work.  The two-phase approach works for all
- *   content types and all sizes without any timeout risk.
+ * Phase 2 — Native browser handoff (GET /stream/:streamId or GET /download/:downloadId):
+ *   An invisible <a download> is clicked immediately once the server confirms readiness.
+ *   The browser's native Download Manager takes over the actual file transfer.
+ *   The frontend resolves and resets to idle — it does NOT wait for the file to finish.
+ *   No blob(), arrayBuffer(), createObjectURL(), or stream buffering is performed.
  */
 export async function downloadFormat(downloadId, onStage) {
   onStage?.('starting');
 
-  // Phase 1: Server-side prepare (download + mux).
-  // This may take several minutes for large adaptive YouTube videos — that is expected.
-  const prepareRes = await fetch(`${BASE}/download/${downloadId}/prepare`, {
-    method: 'POST',
-  });
+  // Short server-side validate check (confirms token, checks size limit upfront)
+  const validateRes = await fetch(`${BASE}/download/${downloadId}/validate`);
+  const validateData = await validateRes.json().catch(() => ({}));
 
-  const prepareData = await prepareRes.json().catch(() => ({}));
-
-  if (!prepareRes.ok || !prepareData.success) {
-    throw new Error(prepareData.error || 'Failed to prepare the download. Please try again.');
+  if (!validateRes.ok || !validateData.success) {
+    throw new Error(validateData.error || 'Failed to prepare the download. Please try again.');
   }
 
-  const { streamId } = prepareData;
-  if (!streamId) {
-    throw new Error('Server did not return a valid stream token. Please try again.');
+  if (validateData.requiresPrepare) {
+    // Adaptive YouTube: server-side prepare (FFmpeg mux).
+    // This is the only legitimate blocking wait — the server must finish muxing
+    // before it can produce a streamId. The UI shows "Processing…" during this time.
+    onStage?.('processing');
+    const prepareRes = await fetch(`${BASE}/download/${downloadId}/prepare`, {
+      method: 'POST',
+    });
+    const prepareData = await prepareRes.json().catch(() => ({}));
+    if (!prepareRes.ok || !prepareData.success) {
+      throw new Error(prepareData.error || 'Failed to prepare the download. Please try again.');
+    }
+    const { streamId } = prepareData;
+    if (!streamId) {
+      throw new Error('Server did not return a valid stream token. Please try again.');
+    }
+
+    // Handoff: native browser download starts here. Frontend does NOT wait for the
+    // file transfer to complete — the Download Manager handles it independently.
+    const streamUrl = `${BASE}/stream/${streamId}`;
+    const a = document.createElement('a');
+    a.href = streamUrl;
+    a.setAttribute('download', '');
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
+  } else {
+    // Direct native browser streaming — no prepare step needed.
+    // Server streams directly from upstream CDN to the browser's Download Manager.
+    const downloadUrl = `${BASE}/download/${downloadId}`;
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.setAttribute('download', '');
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
   }
 
-  // Phase 2: Trigger native browser download using the ready-made stream.
-  // The server responds immediately with headers since the file is already prepared.
-  onStage?.('started');
-
-  const streamUrl = `${BASE}/stream/${streamId}`;
-  const a = document.createElement('a');
-  a.href = streamUrl;
-  a.setAttribute('download', '');
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-
-  // Brief confirmation display before resetting UI state
-  await new Promise((resolve) => setTimeout(resolve, 2500));
+  // Signal complete immediately — the native download is already running in the background.
+  // This resets the UI (spinner → Download button) without waiting for file transfer.
   onStage?.('complete');
 }
 

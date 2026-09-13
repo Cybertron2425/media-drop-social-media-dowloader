@@ -49,6 +49,8 @@ export default function App() {
     setDownloadError('');
     try {
       await downloadFormat(downloadId, setDownloadStage);
+      // downloadFormat resolves immediately after the native browser download
+      // is triggered — file transfer continues independently in the Download Manager.
       setDownloadingId(null);
       setDownloadStage(null);
     } catch (err) {

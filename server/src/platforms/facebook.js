@@ -69,10 +69,11 @@ export class FacebookAdapter extends BaseAdapter {
     // If targetUrl did not redirect or is still a share link, try a GET redirect probe
     if (targetUrl === url && /(?:\/share\/|fb\.watch)/i.test(url)) {
       try {
+        const probeHeaders = /(?:\/share\/r\/|reel)/i.test(url) ? BROWSER_HEADERS : MOBILE_HEADERS;
         const getProbe = await axios.get(url, {
           maxRedirects: 5,
           timeout: 8000,
-          headers: MOBILE_HEADERS,
+          headers: probeHeaders,
           validateStatus: (s) => s >= 200 && s < 400,
         });
         const resolved = getProbe.request?.res?.responseUrl;
@@ -86,21 +87,25 @@ export class FacebookAdapter extends BaseAdapter {
     }
 
     const isStory = /(?:stories)\//i.test(targetUrl) || /(?:stories)\//i.test(url);
+    const isReel = /(?:reel|reels|\/share\/r)\//i.test(targetUrl) || /(?:reel|reels|\/share\/r)\//i.test(url);
+    const reelIdMatch = (targetUrl || url).match(/(?:reel|reels|\/share\/r)\/([0-9a-zA-Z_-]+)/);
 
-    // Extraction strategy: evaluate legitimate public surfaces in order
+    // Extraction strategy: evaluate legitimate public surfaces in order, prioritizing HD sources
     const surfaces = [
+      // 0. Canonical desktop reel plugin if clean numeric/slug reel ID exists
+      ...(isReel && reelIdMatch ? [{ name: 'plugin_clean_reel', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(`https://www.facebook.com/reel/${reelIdMatch[1]}`)}`, headers: BROWSER_HEADERS }] : []),
       // 1. Official Facebook video plugin (primary for Reels and native video posts)
       { name: 'plugin_target', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(targetUrl)}`, headers: BROWSER_HEADERS },
-      // 2. Mobile web with mobile headers (handles public Posts, photos, videos, shares)
-      { name: 'mobile_target', url: targetUrl, headers: MOBILE_HEADERS },
-      // 3. Mobile direct on original url if different
-      ...(targetUrl !== url ? [{ name: 'mobile_orig', url, headers: MOBILE_HEADERS }] : []),
-      // 4. Mobile subdomain m.facebook.com
-      { name: 'mobile_m', url: targetUrl.replace('://www.facebook.com', '://m.facebook.com').replace('://web.facebook.com', '://m.facebook.com'), headers: MOBILE_HEADERS },
-      // 5. Plugin on original url if different
-      ...(targetUrl !== url ? [{ name: 'plugin_orig', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(url)}`, headers: BROWSER_HEADERS }] : []),
-      // 6. Direct desktop web
+      // 2. Direct desktop web (has highest resolution available)
       { name: 'direct', url: targetUrl, headers: BROWSER_HEADERS },
+      // 3. Mobile web with mobile headers (handles public Posts, photos, videos, shares)
+      { name: 'mobile_target', url: targetUrl, headers: MOBILE_HEADERS },
+      // 4. Mobile direct on original url if different
+      ...(targetUrl !== url ? [{ name: 'mobile_orig', url, headers: MOBILE_HEADERS }] : []),
+      // 5. Mobile subdomain m.facebook.com
+      { name: 'mobile_m', url: targetUrl.replace('://www.facebook.com', '://m.facebook.com').replace('://web.facebook.com', '://m.facebook.com'), headers: MOBILE_HEADERS },
+      // 6. Plugin on original url if different
+      ...(targetUrl !== url ? [{ name: 'plugin_orig', url: `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(url)}`, headers: BROWSER_HEADERS }] : []),
     ];
 
     let extractedData = null;
@@ -183,14 +188,36 @@ export class FacebookAdapter extends BaseAdapter {
           cleaned.match(/"sd_src_no_ratelimit"\s*:\s*"(https?:\/\/[^"]+)"/);
         if (sdMatch) sdUrl = sdMatch[1];
 
+        // Video tag fallback
+        if (!hdUrl && !sdUrl) {
+          const videoTagSrc =
+            $('video source[type*="mp4"]').attr('src') ||
+            $('video source').attr('src') ||
+            $('video').attr('src');
+          if (videoTagSrc && videoTagSrc.startsWith('http') && !videoTagSrc.includes('/rsrc.php/')) {
+            sdUrl = videoTagSrc;
+          }
+        }
+
         // OpenGraph fallback
         if (!hdUrl && !sdUrl) {
           const ogVideo =
             $('meta[property="og:video:secure_url"]').attr('content') ||
             $('meta[property="og:video:url"]').attr('content') ||
-            $('meta[property="og:video"]').attr('content');
+            $('meta[property="og:video"]').attr('content') ||
+            $('meta[name="twitter:player:stream"]').attr('content');
           if (ogVideo && ogVideo.startsWith('http')) {
             sdUrl = ogVideo;
+          }
+        }
+
+        // Additional JSON video_url / progressive_url regex
+        if (!hdUrl && !sdUrl) {
+          const vUrlMatch =
+            cleaned.match(/"video_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+            cleaned.match(/"progressive_url"\s*:\s*"(https?:\/\/[^"]+)"/);
+          if (vUrlMatch) {
+            sdUrl = vUrlMatch[1];
           }
         }
 
@@ -208,15 +235,63 @@ export class FacebookAdapter extends BaseAdapter {
           } catch {}
         }
 
-        // Generic fbcdn mp4 fallback
-        if (!hdUrl && !sdUrl) {
+        // If Reel and canonical points to a reel/video page, query plugin with canonical
+        if (!hdUrl && !sdUrl && isReel && canonical && (canonical.includes('/reel/') || canonical.includes('/videos/'))) {
+          try {
+            const canonicalPluginRes = await axios.get(
+              `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(canonical)}`,
+              { timeout: 8000, headers: BROWSER_HEADERS, validateStatus: () => true }
+            );
+            const cHtml = typeof canonicalPluginRes.data === 'string' ? canonicalPluginRes.data : '';
+            const cCleaned = cHtml
+              .replace(/\\+(\/)/g, '/')
+              .replace(/\\+u0026/g, '&')
+              .replace(/\\+u003C/g, '<')
+              .replace(/\\+u003E/g, '>')
+              .replace(/\\+u0022/g, '"')
+              .replace(/\\+"/g, '"');
+            const cHd =
+              cCleaned.match(/"browser_native_hd_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+              cCleaned.match(/"playable_url_quality_hd"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+              cCleaned.match(/"hd_src"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+              cCleaned.match(/"hd_src_no_ratelimit"\s*:\s*"(https?:\/\/[^"]+)"/);
+            const cSd =
+              cCleaned.match(/"browser_native_sd_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+              cCleaned.match(/"playable_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+              cCleaned.match(/"sd_src"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+              cCleaned.match(/"sd_src_no_ratelimit"\s*:\s*"(https?:\/\/[^"]+)"/);
+            if (cHd) hdUrl = cHd[1];
+            if (cSd) sdUrl = cSd[1];
+          } catch {}
+        }
+
+        // Generic fbcdn mp4 fallback (excluding static UI assets), ranking HD vs SD
+        if (!hdUrl || !sdUrl) {
           const mp4Matches = cleaned.match(/https?:\/\/[^"'\s\\]*fbcdn\.net[^"'\s\\]*\.mp4[^"'\s\\]*/g);
           if (mp4Matches && mp4Matches.length > 0) {
-            sdUrl = mp4Matches[0];
+            const validMp4s = mp4Matches.filter((m) => !m.includes('/rsrc.php/'));
+            for (const m of validMp4s) {
+              const isHdCandidate =
+                m.includes('.1280.hd') ||
+                m.includes('.1080.hd') ||
+                m.includes('_hd') ||
+                m.includes('quality_hd') ||
+                m.includes('tag=hd');
+              if (isHdCandidate && !hdUrl) {
+                hdUrl = m;
+              } else if (!isHdCandidate && !sdUrl) {
+                sdUrl = m;
+              }
+            }
+            if (!hdUrl && !sdUrl && validMp4s[0]) {
+              sdUrl = validMp4s[0];
+            }
           }
         }
 
-        if (hdUrl || sdUrl) {
+        // If we found HD (highest quality), we can stop searching.
+        // If only SD was found so far, store it as a fallback but continue searching for HD.
+        if (hdUrl) {
           extractedData = {
             title: title || 'Facebook Video',
             thumbnail,
@@ -226,15 +301,28 @@ export class FacebookAdapter extends BaseAdapter {
             canonical,
           };
           break;
+        } else if (sdUrl && !extractedData) {
+          extractedData = {
+            title: title || 'Facebook Video',
+            thumbnail,
+            hdUrl: null,
+            sdUrl,
+            surface: surface.name,
+            canonical,
+          };
         }
 
-        // Photo / image post fallback
+        // Photo / image post fallback (strictly ignored for Reels)
         const isPhotoContext =
-          /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts|share)/i.test(canonical) ||
-          /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts|share)/i.test(targetUrl) ||
-          /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts|share)/i.test(url) ||
-          $('meta[property="og:type"]').attr('content') === 'article' ||
-          $('meta[property="og:type"]').attr('content') === 'photo';
+          !isReel &&
+          (/(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts)/i.test(canonical) ||
+            /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts)/i.test(targetUrl) ||
+            /(?:photo|photos|\/photo\.php|fbid=|\/p\/|\/post|\/posts)/i.test(url) ||
+            (canonical.includes('/share/') && !canonical.includes('/share/r/') && !canonical.includes('/share/v/')) ||
+            (targetUrl.includes('/share/') && !targetUrl.includes('/share/r/') && !targetUrl.includes('/share/v/')) ||
+            (url.includes('/share/') && !url.includes('/share/r/') && !url.includes('/share/v/')) ||
+            $('meta[property="og:type"]').attr('content') === 'article' ||
+            $('meta[property="og:type"]').attr('content') === 'photo');
 
         if (thumbnail && isPhotoContext && thumbnail.startsWith('http')) {
           extractedData = {
@@ -284,10 +372,24 @@ export class FacebookAdapter extends BaseAdapter {
     // CASE B: Public video media extracted successfully
     const formats = [];
 
+    if (!extractedData.hdUrl && extractedData.sdUrl) {
+      const isActuallyHd =
+        extractedData.sdUrl.includes('.1280.hd') ||
+        extractedData.sdUrl.includes('.1080.hd') ||
+        extractedData.sdUrl.includes('tag=hd') ||
+        extractedData.sdUrl.includes('_hd') ||
+        extractedData.sdUrl.includes('quality_hd');
+      if (isActuallyHd) {
+        extractedData.hdUrl = extractedData.sdUrl;
+        extractedData.sdUrl = null;
+      }
+    }
+
     if (extractedData.hdUrl) {
       formats.push({
         id: 'video-hd',
         quality: 'HD (720p)',
+        resolution: '720p',
         format: 'mp4',
         sizeBytes: null,
         mimeType: 'video/mp4',
@@ -305,6 +407,7 @@ export class FacebookAdapter extends BaseAdapter {
       formats.push({
         id: 'video-sd',
         quality: 'SD (360p)',
+        resolution: '360p',
         format: 'mp4',
         sizeBytes: null,
         mimeType: 'video/mp4',
@@ -337,10 +440,10 @@ export class FacebookAdapter extends BaseAdapter {
 
     const mediaType = isStory
       ? 'story'
+      : isReel
+      ? 'reel'
       : extractedData.imageUrl
       ? 'image'
-      : (/(?:reel|reels)/i.test(targetUrl) || /(?:reel|reels)/i.test(url))
-      ? 'reel'
       : 'video';
 
     return {
