@@ -119,25 +119,51 @@ export default function PlatformGrid() {
           </span>
         </div>
 
-        {/* YouTube Pill */}
+        {/* Pornhub Pill */}
         <div
-          title="YouTube: Videos · Shorts"
-          className="inline-flex flex-row items-center justify-center p-2 sm:px-3 sm:py-1.5 h-10 w-10 sm:h-[42px] sm:w-auto rounded-full border border-red-500/20 bg-red-500/5 transition-all hover:border-red-500/35 hover:bg-red-500/10 dark:border-red-400/25 dark:bg-red-500/10 shadow-sm whitespace-nowrap gap-0 sm:gap-2 shrink-0"
+          title="Pornhub: Videos · Public Content"
+          className="inline-flex flex-row items-center justify-center p-2 sm:px-3 sm:py-1.5 h-10 w-10 sm:h-[42px] sm:w-auto rounded-full border border-orange-500/20 bg-orange-500/5 transition-all hover:border-orange-500/35 hover:bg-orange-500/10 dark:border-orange-400/25 dark:bg-orange-500/10 shadow-sm whitespace-nowrap gap-0 sm:gap-2 shrink-0"
         >
+          {/* Pornhub wordmark-style "PH" icon */}
           <svg
-            className="h-5 w-5 sm:h-[22px] sm:w-[22px] shrink-0 text-red-600 dark:text-red-500"
+            className="h-5 w-5 sm:h-[22px] sm:w-[22px] shrink-0 text-orange-500 dark:text-orange-400"
             viewBox="0 0 24 24"
             fill="currentColor"
             aria-hidden="true"
           >
-            <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+            <rect x="0" y="0" width="24" height="24" rx="4" fill="currentColor" opacity="0.15" />
+            <text x="3" y="17" fontSize="13" fontWeight="900" fontFamily="Arial,sans-serif" fill="currentColor">PH</text>
           </svg>
           <span className="hidden sm:inline text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
-            YouTube
+            Pornhub
           </span>
           <span className="hidden sm:inline-block h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
           <span className="hidden sm:inline text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
-            Videos · Shorts
+            Videos · Public Content
+          </span>
+        </div>
+
+        {/* xHamster Pill */}
+        <div
+          title="xHamster: Videos · Public Content"
+          className="inline-flex flex-row items-center justify-center p-2 sm:px-3 sm:py-1.5 h-10 w-10 sm:h-[42px] sm:w-auto rounded-full border border-red-500/20 bg-red-500/5 transition-all hover:border-red-500/35 hover:bg-red-500/10 dark:border-red-400/25 dark:bg-red-500/10 shadow-sm whitespace-nowrap gap-0 sm:gap-2 shrink-0"
+        >
+          {/* xHamster "xH" logo icon */}
+          <svg
+            className="h-5 w-5 sm:h-[22px] sm:w-[22px] shrink-0 text-red-600 dark:text-red-400"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <rect x="0" y="0" width="24" height="24" rx="4" fill="currentColor" opacity="0.15" />
+            <text x="2" y="17" fontSize="12" fontWeight="900" fontFamily="Arial,sans-serif" fill="currentColor">xH</text>
+          </svg>
+          <span className="hidden sm:inline text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
+            xHamster
+          </span>
+          <span className="hidden sm:inline-block h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
+          <span className="hidden sm:inline text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
+            Videos · Public Content
           </span>
         </div>
       </div>

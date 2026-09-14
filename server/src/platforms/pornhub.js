@@ -277,26 +277,33 @@ export class PornhubAdapter extends BaseAdapter {
   async download(url, options = {}) {
     await assertSafeUrl(url);
 
-    let videoUrl = options.meta?.videoUrl;
-    let title = options.meta?.title;
-    let quality = options.meta?.quality || 'video';
+    const requestedQuality = options.meta?.quality;
+    const requestedFormatId = options.formatId;
 
-    // If options did not contain a pre-resolved video URL, re-analyze to get fresh media definitions
-    if (!videoUrl) {
-      const info = await this.analyze(url);
-      const target = info.formats.find((f) => f.id === options.formatId) || info.formats[0];
-      if (!target?.meta?.videoUrl) {
-        throw new PlatformLimitationError('The requested Pornhub video stream is no longer available.');
-      }
-      videoUrl = target.meta.videoUrl;
-      title = info.title;
-      quality = target.quality;
+    // Pornhub CDN URLs returned by the get_media endpoint are short-lived and
+    // IP-locked (they contain validfrom/validto/ip query parameters that expire
+    // in ~2 hours and only work from the originating IP address).
+    // Re-using the videoUrl stored during analyze() at download time causes 403s.
+    // We MUST always re-run analyze() here to get a fresh signed CDN URL.
+    const info = await this.analyze(url);
+    const title = options.meta?.title || info.title;
+
+    // Select the format matching the quality requested at analyze time, falling
+    // back to formatId match, then to the best available format.
+    const target =
+      (requestedQuality && info.formats.find((f) => f.meta?.quality === requestedQuality)) ||
+      (requestedFormatId && info.formats.find((f) => f.id === requestedFormatId)) ||
+      info.formats[0];
+
+    if (!target?.meta?.videoUrl) {
+      throw new PlatformLimitationError('The requested Pornhub video stream is no longer available.');
     }
 
+    const videoUrl = target.meta.videoUrl;
     await assertSafeUrl(videoUrl);
 
     const safeTitle = sanitizeFilename(title || 'Pornhub_Video');
-    const filename = `${safeTitle}_${sanitizeFilename(quality)}.mp4`;
+    const filename = `${safeTitle}_${sanitizeFilename(target.quality)}.mp4`;
 
     const result = await downloadStream(videoUrl, {
       ...options,
