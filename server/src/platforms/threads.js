@@ -217,6 +217,12 @@ export class ThreadsAdapter extends BaseAdapter {
         mimeType: 'video/mp4',
         sourceUrl: videoUrl,
         hasAudio: true,
+        meta: {
+          headers: {
+            'Referer': 'https://www.threads.net/',
+            'User-Agent': BROWSER_HEADERS['User-Agent'],
+          },
+        },
       });
     } else {
       let ext = 'jpg';
@@ -233,6 +239,12 @@ export class ThreadsAdapter extends BaseAdapter {
         mimeType: `image/${ext === 'jpg' ? 'jpeg' : ext}`,
         sourceUrl: imageUrl,
         hasAudio: false,
+        meta: {
+          headers: {
+            'Referer': 'https://www.threads.net/',
+            'User-Agent': BROWSER_HEADERS['User-Agent'],
+          },
+        },
       });
     }
 
@@ -247,6 +259,17 @@ export class ThreadsAdapter extends BaseAdapter {
   }
 
   async download(url, options = {}) {
-    return downloadStream(url, options);
+    const sourceUrl = options.sourceUrl || url;
+    return downloadStream(sourceUrl, {
+      ...options,
+      meta: {
+        ...(options.meta || {}),
+        headers: {
+          'Referer': 'https://www.threads.net/',
+          'User-Agent': BROWSER_HEADERS['User-Agent'],
+          ...(options.meta?.headers || {}),
+        },
+      },
+    });
   }
 }
