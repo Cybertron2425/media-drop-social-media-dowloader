@@ -3,11 +3,12 @@ import { FacebookAdapter } from './facebook.js';
 import { SnapchatAdapter } from './snapchat.js';
 import { TikTokAdapter } from './tiktok.js';
 import { TwitterAdapter } from './twitter.js';
+import { ThreadsAdapter } from './threads.js';
 import { PublicMediaAdapter } from './publicMedia.js';
 
 /**
  * Platform registry:
- * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X
+ * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, Threads
  * - Generic adapter: PublicMediaAdapter for legitimate third-party public media
  */
 const adapters = [
@@ -16,6 +17,7 @@ const adapters = [
   new SnapchatAdapter(),
   new TikTokAdapter(),
   new TwitterAdapter(),
+  new ThreadsAdapter(),
   new PublicMediaAdapter(),
 ];
 

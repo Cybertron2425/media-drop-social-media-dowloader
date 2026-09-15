@@ -118,6 +118,28 @@ export default function PlatformGrid() {
             Posts · Videos · Images
           </span>
         </div>
+
+        {/* Threads Pill */}
+        <div
+          title="Threads: Posts · Photos · Videos"
+          className="inline-flex flex-row items-center justify-center p-2 sm:px-3 sm:py-1.5 h-10 w-10 sm:h-[42px] sm:w-auto rounded-full border border-neutral-500/20 bg-neutral-500/5 transition-all hover:border-neutral-500/35 hover:bg-neutral-500/10 dark:border-neutral-400/25 dark:bg-neutral-500/10 shadow-sm whitespace-nowrap gap-0 sm:gap-2 shrink-0"
+        >
+          <svg
+            className="h-[18px] w-[18px] sm:h-[20px] sm:w-[20px] shrink-0 text-slate-900 dark:text-white"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M12.186 24c-3.535 0-6.425-1.192-8.588-3.543C1.488 18.17.404 15.006.366 11.02.328 7.07 1.418 3.896 3.606 1.57 5.794-.755 8.796-.51 12.545-.51c3.784 0 6.808 1.254 8.986 3.727 2.164 2.456 3.23 5.797 3.17 9.932-.06 4.148-1.196 7.42-3.374 9.725-2.179 2.304-5.187 3.488-8.941 3.518v-2.388c3.08-.03 5.49-.974 7.162-2.805 1.685-1.846 2.56-4.522 2.607-7.954.048-3.418-.769-6.107-2.428-7.994-1.646-1.874-4.01-2.825-7.025-2.825-3.076 0-5.467.925-7.108 2.75-1.655 1.838-2.49 4.453-2.482 7.771.008 3.303.855 5.922 2.518 7.784 1.648 1.846 3.987 2.793 6.953 2.815 2.476.018 4.542-.647 6.141-1.977l1.523 1.835c-2.016 1.706-4.664 2.568-7.872 2.544zm3.037-7.95c-.394.382-.876.67-1.433.855-.557.185-1.17.278-1.825.278-1.573 0-2.844-.457-3.785-1.358-.941-.9-1.423-2.127-1.435-3.652-.012-1.547.459-2.784 1.402-3.684.943-.9 2.222-1.354 3.808-1.354 1.585 0 2.853.454 3.774 1.35.921.895 1.385 2.13 1.38 3.677-.005 1.583-.496 2.826-1.464 3.704-.968.878-2.28 1.324-3.905 1.324-1.077 0-2.02-.2-2.808-.595-.788-.396-1.387-.96-1.784-1.68-.397-.72-.6-1.579-.604-2.557-.005-1.127.247-2.106.75-2.915.503-.808 1.206-1.423 2.096-1.83.89-.407 1.905-.615 3.023-.618.396 0 .762.026 1.09.076.328.05.626.126.887.227v1.893c-.273-.09-.57-.158-.887-.202-.317-.044-.658-.066-1.018-.066-.827.002-1.564.152-2.195.447-.63.295-1.124.729-1.47 1.293-.347.564-.52 1.246-.516 2.032.003.793.18 1.468.528 2.012.348.544.846.953 1.482 1.219.636.266 1.378.4 2.213.4 1.09 0 1.983-.298 2.659-.887.676-.589 1.018-1.43 1.018-2.502v-5.267h2.24v5.39c0 1.63-.44 2.92-1.31 3.842z" />
+          </svg>
+          <span className="hidden sm:inline text-[13px] sm:text-[14px] font-bold text-slate-900 dark:text-slate-100 shrink-0 leading-none">
+            Threads
+          </span>
+          <span className="hidden sm:inline-block h-3 w-px bg-slate-300 dark:bg-slate-700 shrink-0" aria-hidden="true" />
+          <span className="hidden sm:inline text-[11px] sm:text-[12px] text-slate-500 dark:text-slate-400 font-normal leading-none shrink-0 whitespace-nowrap">
+            Posts · Photos · Videos
+          </span>
+        </div>
       </div>
 
       {/* Subtle bottom note */}
