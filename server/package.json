@@ -8,7 +8,6 @@
     "test": "node --test --test-concurrency=1 src/**/*.test.js"
   },
   "dependencies": {
-    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@ffprobe-installer/ffprobe": "^2.1.2",
     "archiver": "^8.0.0",
     "axios": "^1.7.7",
@@ -19,7 +18,6 @@
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "mime-types": "^2.1.35",
-    "nanoid": "^5.0.7",
-    "youtubei.js": "^18.0.0"
+    "nanoid": "^5.0.7"
   }
 }

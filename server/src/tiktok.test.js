@@ -83,7 +83,7 @@ test('TikTok Adapter - Public Media, Short Links, and Error Handling', async (t)
     assert.equal(adapter.canHandle('https://instagram.com/reel/12345'), false);
     assert.equal(adapter.canHandle('https://facebook.com/reel/12345'), false);
     assert.equal(adapter.canHandle('https://snapchat.com/t/12345'), false);
-    assert.equal(adapter.canHandle('https://youtube.com/watch?v=123'), false);
+    assert.equal(adapter.canHandle('https://unsupported-domain.invalid/video/123'), false);
     assert.equal(adapter.canHandle('invalid-url'), false);
 
     // resolveAdapter resolution

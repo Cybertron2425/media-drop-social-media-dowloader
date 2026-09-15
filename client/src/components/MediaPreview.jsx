@@ -18,8 +18,6 @@ function getPlatformTypeLabel(platform, type, isHighlight) {
   else if (platform === 'snapchat') pName = 'Snapchat';
   else if (platform === 'tiktok') pName = 'TikTok';
   else if (platform === 'twitter' || platform === 'x') pName = 'X';
-  else if (platform === 'youtube') pName = 'YouTube';
-  else if (platform === 'pornhub') pName = 'Pornhub';
   else if (platform === 'public-media' || platform === 'public') pName = 'Public Media';
   else if (platform) pName = platform.charAt(0).toUpperCase() + platform.slice(1);
 

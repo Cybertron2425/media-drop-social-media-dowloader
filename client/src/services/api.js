@@ -21,8 +21,8 @@ export async function analyzeUrl(url) {
  * Two-phase download flow:
  *
  * Phase 1 — Prepare (POST /download/:downloadId/prepare):
- *   Server performs all heavy work (fetch, FFmpeg mux for adaptive YouTube, etc.) and
- *   writes the result to a temp file.  This may take several minutes for large 4K content.
+ *   Server performs all heavy work (fetch, stream packaging, etc.) and
+ *   writes the result to a temp file.
  *   The UI shows an honest "Processing…" spinner during this time.
  *
  * Phase 2 — Native browser handoff (GET /stream/:streamId or GET /download/:downloadId):
@@ -43,9 +43,7 @@ export async function downloadFormat(downloadId, onStage) {
   }
 
   if (validateData.requiresPrepare) {
-    // Adaptive YouTube: server-side prepare (FFmpeg mux).
-    // This is the only legitimate blocking wait — the server must finish muxing
-    // before it can produce a streamId. The UI shows "Processing…" during this time.
+    // Server-side prepare step if required by the adapter.
     onStage?.('processing');
     const prepareRes = await fetch(`${BASE}/download/${downloadId}/prepare`, {
       method: 'POST',

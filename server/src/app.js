@@ -8,10 +8,25 @@ import routes from './routes/index.js';
 
 const app = express();
 
+app.disable('x-powered-by');
 app.use(helmet());
+
+const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. server-to-server or curl)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+        return callback(null, true);
+      }
+      return callback(new Error('CORS origin denied.'));
+    },
+    credentials: true,
   })
 );
 app.use(express.json({ limit: '10kb' }));

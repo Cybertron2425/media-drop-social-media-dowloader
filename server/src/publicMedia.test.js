@@ -78,6 +78,7 @@ test('Third-Party Public Media Adapter', async (t) => {
     // Strictly blocked platforms
     assert.equal(publicAdapter.canHandle('https://www.youtube.com/watch?v=123'), false);
     assert.equal(publicAdapter.canHandle('https://youtu.be/123'), false);
+    assert.equal(publicAdapter.canHandle('https://www.pornhub.com/view_video.php?viewkey=123'), false);
     assert.equal(publicAdapter.canHandle('https://www.tiktok.com/@user/video/123'), false);
     assert.equal(publicAdapter.canHandle('https://twitter.com/user/status/123'), false);
     assert.equal(publicAdapter.canHandle('https://x.com/user/status/123'), false);

@@ -1,18 +1,20 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
 
-// Private / reserved / loopback / link-local ranges to block for SSRF protection.
+// Private / reserved / loopback / link-local / broadcast ranges to block for SSRF protection.
 const BLOCKED_IPV4_RANGES = [
-  { base: '0.0.0.0', bits: 8 },
-  { base: '10.0.0.0', bits: 8 },
-  { base: '100.64.0.0', bits: 10 }, // CGNAT
-  { base: '127.0.0.0', bits: 8 },
-  { base: '169.254.0.0', bits: 16 },
-  { base: '172.16.0.0', bits: 12 },
-  { base: '192.0.0.0', bits: 24 },
-  { base: '192.168.0.0', bits: 16 },
-  { base: '198.18.0.0', bits: 15 },
-  { base: '224.0.0.0', bits: 4 }, // multicast
+  { base: '0.0.0.0', bits: 8 },       // Current network (only valid as source)
+  { base: '10.0.0.0', bits: 8 },      // Private-use (RFC 1918)
+  { base: '100.64.0.0', bits: 10 },   // Shared Address Space (CGNAT)
+  { base: '127.0.0.0', bits: 8 },     // Loopback
+  { base: '169.254.0.0', bits: 16 },  // Link-local / Cloud metadata (e.g. AWS/GCP 169.254.169.254)
+  { base: '172.16.0.0', bits: 12 },   // Private-use (RFC 1918)
+  { base: '192.0.0.0', bits: 24 },    // IETF Protocol Assignments
+  { base: '192.168.0.0', bits: 16 },  // Private-use (RFC 1918)
+  { base: '198.18.0.0', bits: 15 },   // Benchmarking
+  { base: '224.0.0.0', bits: 4 },     // Multicast
+  { base: '240.0.0.0', bits: 4 },     // Reserved (former Class E)
+  { base: '255.255.255.255', bits: 32 }, // Limited broadcast
 ];
 
 function ipToLong(ip) {
@@ -30,14 +32,20 @@ export function isBlockedIpv4(ip) {
 
 export function isBlockedIpv6(ip) {
   const lower = ip.toLowerCase();
+  if (lower === '::1' || lower === '::') {
+    return true;
+  }
+  // Check IPv4-mapped IPv6 address (e.g. ::ffff:127.0.0.1 or ::ffff:169.254.169.254)
+  if (lower.startsWith('::ffff:')) {
+    const ipv4Part = lower.slice(7);
+    if (net.isIPv4(ipv4Part)) {
+      return isBlockedIpv4(ipv4Part);
+    }
+  }
   return (
-    lower === '::1' ||
     lower.startsWith('fe80:') || // link-local
-    lower.startsWith('fc') ||
-    lower.startsWith('fd') || // unique local
-    lower.startsWith('::ffff:127.') ||
-    lower.startsWith('::ffff:10.') ||
-    lower.startsWith('::ffff:192.168.')
+    lower.startsWith('fc') ||    // unique local (fc00::/7)
+    lower.startsWith('fd')
   );
 }
 
@@ -58,8 +66,18 @@ export async function assertSafeUrl(rawUrl) {
     throw new Error('Please enter a valid media URL.');
   }
 
+  // Reject embedded credentials in URL to avoid URL confusion/leaks
+  if (parsed.username || parsed.password) {
+    throw new Error('This URL cannot be processed.');
+  }
+
   const hostname = parsed.hostname.toLowerCase();
-  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname.endsWith('.internal')) {
+    throw new Error('This URL cannot be processed.');
+  }
+
+  // Restrict destination ports to standard web ports to prevent intranet port scanning
+  if (parsed.port && !['80', '443', '8080', '8443'].includes(parsed.port)) {
     throw new Error('This URL cannot be processed.');
   }
 

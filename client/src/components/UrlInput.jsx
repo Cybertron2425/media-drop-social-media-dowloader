@@ -44,8 +44,8 @@ export default function UrlInput({ onSubmit, isLoading, onClear }) {
             required
             value={value}
             onChange={(e) => setValue(e.target.value)}
-            placeholder="Paste YouTube, Instagram, Facebook, Snapchat, TikTok, or X URL here..."
-            aria-label="Paste YouTube, Instagram, Facebook, Snapchat, TikTok, or X URL"
+            placeholder="Paste Instagram, Facebook, Snapchat, TikTok, or X URL here..."
+            aria-label="Paste Instagram, Facebook, Snapchat, TikTok, or X URL"
             className="w-full bg-transparent px-2.5 py-3 text-base text-slate-900 placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500 focus:outline-none"
           />
 
@@ -124,7 +124,7 @@ export default function UrlInput({ onSubmit, isLoading, onClear }) {
           <line x1="12" y1="16" x2="12" y2="12" />
           <line x1="12" y1="8" x2="12.01" y2="8" />
         </svg>
-        <span>Supports public YouTube, Instagram, Facebook, Snapchat, TikTok & X links only. No login or account required.</span>
+        <span>Supports public Instagram, Facebook, Snapchat, TikTok & X links only. No login or account required.</span>
       </div>
     </div>
   );

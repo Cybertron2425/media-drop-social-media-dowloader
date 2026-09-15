@@ -1,6 +1,7 @@
 import axios from 'axios';
+import net from 'node:net';
 import mime from 'mime-types';
-import { assertSafeUrl } from './urlSafety.js';
+import { assertSafeUrl, isBlockedIpv4, isBlockedIpv6 } from './urlSafety.js';
 
 /**
  * Downloads a media stream directly from a public URL using axios.
@@ -17,6 +18,35 @@ export async function downloadStream(url, options = {}) {
       responseType: 'stream',
       timeout: 15000,
       maxRedirects: 3,
+      beforeRedirect: (redirectOptions) => {
+        const redirectUrl =
+          redirectOptions.href ||
+          `${redirectOptions.protocol}//${redirectOptions.hostname}${redirectOptions.path || ''}`;
+        try {
+          const u = new URL(redirectUrl);
+          if (!['http:', 'https:'].includes(u.protocol)) {
+            throw new Error('Invalid redirect protocol.');
+          }
+          if (u.username || u.password) {
+            throw new Error('Invalid redirect credentials.');
+          }
+          const host = u.hostname.toLowerCase();
+          if (
+            host === 'localhost' ||
+            host.endsWith('.localhost') ||
+            host.endsWith('.local') ||
+            host.endsWith('.internal')
+          ) {
+            throw new Error('Blocked redirect target.');
+          }
+          if (net.isIP(host)) {
+            if (net.isIP(host) === 4 && isBlockedIpv4(host)) throw new Error('Blocked IPv4 redirect.');
+            if (net.isIP(host) === 6 && isBlockedIpv6(host)) throw new Error('Blocked IPv6 redirect.');
+          }
+        } catch (e) {
+          throw new Error('This URL cannot be processed.');
+        }
+      },
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',

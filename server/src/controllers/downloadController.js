@@ -56,7 +56,7 @@ export async function validateDownloadHandler(req, res) {
     return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
   }
 
-  // For adapters with direct media stream URLs (e.g. Pornhub), perform an upstream HEAD check
+  // For adapters with direct media stream URLs, perform an upstream HEAD check for size limit
   if (token.meta?.videoUrl && !token.meta.sizeBytes) {
     try {
       const headers = {
@@ -64,9 +64,6 @@ export async function validateDownloadHandler(req, res) {
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         ...(token.meta.headers || {}),
       };
-      if (token.platform === 'pornhub' && !headers.Referer && !headers.referer) {
-        headers.Referer = 'https://www.pornhub.org/';
-      }
 
       const headRes = await axios.head(token.meta.videoUrl, {
         timeout: 4000,
@@ -85,14 +82,7 @@ export async function validateDownloadHandler(req, res) {
     }
   }
 
-  // YouTube's download() method always writes the full file to disk before returning a
-  // stream (both pre-muxed formats and adaptive formats that need FFmpeg muxing).
-  // Routing YouTube through streamDownload() would block the HTTP response until the
-  // entire file is on the server's disk — the browser Download Manager would never see
-  // bytes until then.  The two-phase prepare→stream flow is correct for ALL YouTube
-  // formats: it shows an honest "Processing…" spinner, then immediately hands off to the
-  // browser's native Download Manager the instant the prepared file is ready.
-  const requiresPrepare = token.platform === 'youtube';
+  const requiresPrepare = false;
 
   return res.json({
     success: true,

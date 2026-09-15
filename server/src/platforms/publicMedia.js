@@ -8,6 +8,9 @@ import { downloadStream } from '../utils/streamDownloader.js';
 const BLOCKED_HOSTS = [
   'youtube.com',
   'youtu.be',
+  'pornhub.com',
+  'pornhub.org',
+  'xhamster.com',
   'tiktok.com',
   'twitter.com',
   'x.com',
