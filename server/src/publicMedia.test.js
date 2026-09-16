@@ -336,6 +336,79 @@ test('Third-Party Public Media Adapter', async (t) => {
     assert.equal(streamData.error, 'The media is no longer available.');
   });
 
+  await t.test('Detects HLS/DASH only pages and returns clear limitation error', async () => {
+    const hlsHtml = `
+      <!DOCTYPE html>
+      <html>
+        <head><title>HLS Video Page</title></head>
+        <body>
+          <video>
+            <source src="https://example.com/live/playlist.m3u8" type="application/x-mpegURL">
+          </video>
+        </body>
+      </html>
+    `;
+
+    axios.get = async () => ({
+      data: hlsHtml,
+      headers: { 'content-type': 'text/html' },
+    });
+
+    const publicAdapter = getAdapter('public-media');
+    await assert.rejects(
+      async () => {
+        await publicAdapter.analyze('https://example.com/hls-video');
+      },
+      (err) => {
+        assert.ok(err instanceof PlatformLimitationError);
+        assert.match(err.message, /HLS\/DASH streaming manifest/i);
+        return true;
+      }
+    );
+  });
+
+  await t.test('Retries download without Referer when CDN returns 403 to cross-origin Referer', async () => {
+    let callCount = 0;
+    const calls = [];
+
+    axios.get = async (url, config = {}) => {
+      callCount++;
+      calls.push({ url, headers: config.headers });
+      if (callCount === 1) {
+        // First attempt with Referer receives 403 from CDN
+        const err = new Error('Request failed with status code 403');
+        err.response = { status: 403, headers: { 'content-type': 'text/plain' } };
+        throw err;
+      }
+      // Second attempt without Referer succeeds
+      const stream = new Readable();
+      stream.push(Buffer.from('stream without referer'));
+      stream.push(null);
+      return {
+        data: stream,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': '22',
+        },
+      };
+    };
+
+    const publicAdapter = getAdapter('public-media');
+    const result = await publicAdapter.download('https://example.com/video.mp4', {
+      sourceUrl: 'https://example.com/video.mp4',
+      meta: {
+        pageUrl: 'https://example.com/page',
+        headers: { Referer: 'https://example.com/page' },
+      },
+    });
+
+    assert.ok(result.stream);
+    assert.equal(callCount, 2);
+    assert.equal(calls[0].headers.Referer, 'https://example.com/page');
+    assert.equal(calls[1].headers.Referer, undefined);
+    assert.equal(result.mimeType, 'video/mp4');
+  });
+
   await t.test('Instagram and Facebook adapters remain active and registered', () => {
     assert.ok(getAdapter('instagram'), 'InstagramAdapter must exist');
     assert.ok(getAdapter('facebook'), 'FacebookAdapter must exist');
@@ -343,3 +416,4 @@ test('Third-Party Public Media Adapter', async (t) => {
     assert.equal(resolveAdapter('https://www.facebook.com/watch/?v=123').constructor.platformId, 'facebook');
   });
 });
+

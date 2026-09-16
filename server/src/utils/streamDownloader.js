@@ -50,9 +50,16 @@ export async function downloadStream(url, options = {}) {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept': '*/*',
         ...customHeaders,
       },
     });
+
+    const contentType = (response.headers['content-type'] || '').toLowerCase();
+    if (contentType.startsWith('text/html') || contentType.startsWith('application/xhtml')) {
+      response.data?.destroy?.();
+      throw new Error('This video cannot be downloaded from this source.');
+    }
   } catch (err) {
     console.error(
       `[DownloadStream Error] target=${targetUrl.slice(0, 80)} status=${err.response?.status} contentType=${err.response?.headers?.['content-type']} code=${err.code} err=${err.message}`
@@ -71,9 +78,16 @@ export async function downloadStream(url, options = {}) {
 
   const ext = parsed.pathname.split('.').pop()?.toLowerCase() || 'bin';
   const filename = decodeURIComponent(parsed.pathname.split('/').pop() || `download.${ext}`);
-  const sizeBytes = response.headers['content-length']
+  const contentRange = response.headers['content-range'];
+  let sizeBytes = response.headers['content-length']
     ? parseInt(response.headers['content-length'], 10)
     : null;
+  if (contentRange && typeof contentRange === 'string') {
+    const totalMatch = contentRange.match(/\/(\d+)$/);
+    if (totalMatch) {
+      sizeBytes = parseInt(totalMatch[1], 10);
+    }
+  }
 
   return {
     stream: response.data,

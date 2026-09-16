@@ -120,8 +120,26 @@ export class PublicMediaAdapter extends BaseAdapter {
     const pathnameLower = parsed.pathname.toLowerCase();
     const isDirectVideo = DIRECT_VIDEO_EXTS.some((ext) => pathnameLower.endsWith(ext));
 
-    // Case 1: Direct link to a media file
+    let isHtmlDoc = false;
     if (isDirectVideo) {
+      try {
+        const head = await axios.head(url, {
+          headers: BROWSER_HEADERS,
+          timeout: 4000,
+          maxRedirects: 3,
+          validateStatus: (s) => s >= 200 && s < 400,
+        });
+        const cType = (head.headers['content-type'] || '').toLowerCase();
+        if (cType.includes('text/html') || cType.includes('application/xhtml')) {
+          isHtmlDoc = true;
+        }
+      } catch {
+        // Continue to treat as direct video if HEAD fails
+      }
+    }
+
+    // Case 1: Direct link to a media file
+    if (isDirectVideo && !isHtmlDoc) {
       const filename = decodeURIComponent(parsed.pathname.split('/').pop() || 'video.mp4');
       const ext = filename.split('.').pop()?.toLowerCase() || 'mp4';
       const resInfo = extractResolution(filename);
@@ -146,7 +164,6 @@ export class PublicMediaAdapter extends BaseAdapter {
               pageUrl: url,
               headers: {
                 'Referer': url,
-                'Origin': parsed.origin,
               },
             },
           },
@@ -266,6 +283,7 @@ export class PublicMediaAdapter extends BaseAdapter {
     // Process, validate, and deduplicate candidates
     const validFormats = [];
     const seenUrls = new Set();
+    let hasHlsOrDash = false;
 
     for (const cand of rawCandidates) {
       if (!cand.src || typeof cand.src !== 'string') continue;
@@ -290,6 +308,7 @@ export class PublicMediaAdapter extends BaseAdapter {
       const lowerUrl = resolvedUrl.toLowerCase();
       // Skip live streams or manifest files requiring external remuxing
       if (lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd')) {
+        hasHlsOrDash = true;
         continue;
       }
 
@@ -314,13 +333,17 @@ export class PublicMediaAdapter extends BaseAdapter {
           pageUrl: url,
           headers: {
             'Referer': url,
-            'Origin': parsed.origin,
           },
         },
       });
     }
 
     if (validFormats.length === 0) {
+      if (hasHlsOrDash) {
+        throw new PlatformLimitationError(
+          'This public video uses an HLS/DASH streaming manifest (.m3u8/.mpd) which requires stream remuxing and cannot be downloaded as a direct stream.'
+        );
+      }
       throw new PlatformLimitationError('This video cannot be downloaded from this source.');
     }
 
@@ -339,22 +362,45 @@ export class PublicMediaAdapter extends BaseAdapter {
   async download(url, options = {}) {
     const sourceUrl = options.sourceUrl || url;
     const pageUrl = options.meta?.pageUrl;
-    const referer = options.meta?.headers?.Referer || pageUrl || url;
-    const origin = options.meta?.headers?.Origin || (pageUrl ? new URL(pageUrl).origin : undefined);
+    const referer = options.meta?.headers?.Referer || pageUrl;
 
-    const headers = {
+    const baseHeaders = {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
-      'Referer': referer,
-      ...(origin ? { 'Origin': origin } : {}),
-      ...(options.meta?.headers || {}),
+      'Accept': '*/*',
     };
 
-    return downloadStream(sourceUrl, {
-      ...options,
-      meta: {
-        ...options.meta,
-        headers,
-      },
-    });
+    const headers = {
+      ...baseHeaders,
+      ...(referer ? { 'Referer': referer } : {}),
+      ...(options.meta?.headers || {}),
+    };
+    delete headers.Origin;
+    delete headers.origin;
+
+    try {
+      return await downloadStream(sourceUrl, {
+        ...options,
+        meta: {
+          ...options.meta,
+          headers,
+        },
+      });
+    } catch (err) {
+      // If download failed with 403 and we sent a Referer, retry without Referer
+      // (many public CDNs/S3 buckets block cross-origin Referer headers)
+      if (headers.Referer && (err.message?.includes('cannot be downloaded') || err.response?.status === 403)) {
+        const noRefHeaders = { ...headers };
+        delete noRefHeaders.Referer;
+        delete noRefHeaders.referer;
+        return downloadStream(sourceUrl, {
+          ...options,
+          meta: {
+            ...options.meta,
+            headers: noRefHeaders,
+          },
+        });
+      }
+      throw err;
+    }
   }
 }
