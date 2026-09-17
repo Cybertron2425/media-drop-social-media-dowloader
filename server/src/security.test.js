@@ -58,15 +58,15 @@ test('Security Hardening & Platform Removal Verification', async (t) => {
     });
   });
 
-  await t.test('1. Pornhub and YouTube are completely unhandled and rejected', async () => {
+  await t.test('1. Pornhub is unhandled and YouTube is registered', async () => {
     assert.strictEqual(getAdapter('pornhub'), undefined, 'PornhubAdapter must not exist in registry');
-    assert.strictEqual(getAdapter('youtube'), undefined, 'YouTubeAdapter must not exist in registry');
+    assert.ok(getAdapter('youtube'), 'YouTubeAdapter must be registered');
 
     const phAdapter = resolveAdapter('https://www.pornhub.com/view_video.php?viewkey=64f7b6058a23a');
     assert.strictEqual(phAdapter, undefined, 'resolveAdapter must return undefined for Pornhub URL');
 
     const ytAdapter = resolveAdapter('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
-    assert.strictEqual(ytAdapter, undefined, 'resolveAdapter must return undefined for YouTube URL');
+    assert.ok(ytAdapter, 'resolveAdapter must return YouTubeAdapter for YouTube URL');
 
     // /api/analyze returns 400 for Pornhub
     const phRes = await makeRequest(
@@ -79,16 +79,6 @@ test('Security Hardening & Platform Removal Verification', async (t) => {
     assert.strictEqual(phJson.success, false);
     assert.strictEqual(phJson.error, 'This platform is currently not supported.');
 
-    // /api/analyze returns 400 for YouTube
-    const ytRes = await makeRequest(
-      server,
-      { method: 'POST', path: '/api/analyze', headers: { 'Content-Type': 'application/json' } },
-      { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }
-    );
-    assert.strictEqual(ytRes.statusCode, 400);
-    const ytJson = ytRes.json();
-    assert.strictEqual(ytJson.success, false);
-    assert.strictEqual(ytJson.error, 'This platform is currently not supported.');
   });
 
   await t.test('2. SSRF protection strictly blocks all private/internal and metadata IP ranges', async () => {

@@ -7,7 +7,7 @@ import { downloadStream } from '../utils/streamDownloader.js';
 const IG_HOSTS = ['instagram.com', 'instagr.am'];
 const SHORTCODE_RE = /(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/;
 const HIGHLIGHT_RE = /(?:stories\/highlights\/)([0-9A-Za-z_-]+)/;
-const HIGHLIGHT_SHARE_RE = /(?:s\/)([0-9A-Za-z_=-]+)/;
+const HIGHLIGHT_SHARE_RE = /(?:^|\/)s\/([0-9A-Za-z_=-]+)/;
 
 const BROWSER_HEADERS = {
   'User-Agent':
@@ -79,8 +79,10 @@ export class InstagramAdapter extends BaseAdapter {
     await assertSafeUrl(url);
 
     const parsed = new URL(url);
+    const shortcodeMatch = parsed.pathname.match(SHORTCODE_RE);
+
     const highlightMatch = parsed.pathname.match(HIGHLIGHT_RE);
-    const shareHighlightMatch = parsed.pathname.match(HIGHLIGHT_SHARE_RE);
+    const shareHighlightMatch = !shortcodeMatch && parsed.pathname.match(HIGHLIGHT_SHARE_RE);
 
     if (highlightMatch && highlightMatch[1]) {
       return this.analyzeHighlight(url, parsed, highlightMatch[1]);
@@ -97,24 +99,36 @@ export class InstagramAdapter extends BaseAdapter {
       return this.analyzeHighlight(url, parsed, highlightId);
     }
 
-    const match = parsed.pathname.match(SHORTCODE_RE);
+    const match = shortcodeMatch;
     if (!match || !match[1]) {
       throw new Error('Please enter a valid Instagram post, reel, or highlight URL.');
     }
 
     const shortcode = match[1];
+    const isReel = /(?:reel|reels)/i.test(parsed.pathname);
 
-    // Extraction strategy: test legitimate unauthenticated public surfaces in priority order
-    const surfaces = [
-      { name: 'embed_captioned_p', url: `https://www.instagram.com/p/${shortcode}/embed/captioned/` },
-      { name: 'embed_captioned_reel', url: `https://www.instagram.com/reel/${shortcode}/embed/captioned/` },
-      { name: 'embed_p', url: `https://www.instagram.com/p/${shortcode}/embed/` },
-      { name: 'embed_reel', url: `https://www.instagram.com/reel/${shortcode}/embed/` },
-      { name: 'direct_reel', url: `https://www.instagram.com/reel/${shortcode}/` },
-      { name: 'direct_p', url: `https://www.instagram.com/p/${shortcode}/` },
-    ];
+    // Extraction strategy: test legitimate unauthenticated public surfaces in priority order.
+    // For Reels, prioritize reel endpoints and ensure the video stream is discovered.
+    const surfaces = isReel
+      ? [
+          { name: 'embed_captioned_reel', url: `https://www.instagram.com/reel/${shortcode}/embed/captioned/` },
+          { name: 'embed_reel', url: `https://www.instagram.com/reel/${shortcode}/embed/` },
+          { name: 'direct_reel', url: `https://www.instagram.com/reel/${shortcode}/` },
+          { name: 'embed_captioned_p', url: `https://www.instagram.com/p/${shortcode}/embed/captioned/` },
+          { name: 'embed_p', url: `https://www.instagram.com/p/${shortcode}/embed/` },
+          { name: 'direct_p', url: `https://www.instagram.com/p/${shortcode}/` },
+        ]
+      : [
+          { name: 'embed_captioned_p', url: `https://www.instagram.com/p/${shortcode}/embed/captioned/` },
+          { name: 'embed_captioned_reel', url: `https://www.instagram.com/reel/${shortcode}/embed/captioned/` },
+          { name: 'embed_p', url: `https://www.instagram.com/p/${shortcode}/embed/` },
+          { name: 'embed_reel', url: `https://www.instagram.com/reel/${shortcode}/embed/` },
+          { name: 'direct_p', url: `https://www.instagram.com/p/${shortcode}/` },
+          { name: 'direct_reel', url: `https://www.instagram.com/reel/${shortcode}/` },
+        ];
 
     let extractedMedia = null;
+    let fallbackMedia = null;
     let isPrivate = false;
     let loginChallengeEncountered = false;
     let notFoundEncountered = false;
@@ -177,39 +191,49 @@ export class InstagramAdapter extends BaseAdapter {
         let thumbnailUrl = $('video').attr('poster') || $('.EmbeddedMediaImage').attr('src') || ogImage || jsonLdImage || null;
 
         // 5. Script hydration data with multi-level unescaping
-        if (!videoUrl) {
-          const cleaned = html
-            .replace(/\\+(\/)/g, '/')
-            .replace(/\\+u0026/g, '&')
-            .replace(/\\+u003C/g, '<')
-            .replace(/\\+u003E/g, '>')
-            .replace(/\\+u0022/g, '"')
-            .replace(/\\+"/g, '"');
+        const cleaned = html
+          .replace(/\\+(\/)/g, '/')
+          .replace(/\\+u0026/g, '&')
+          .replace(/\\+u003C/g, '<')
+          .replace(/\\+u003E/g, '>')
+          .replace(/\\+u0022/g, '"')
+          .replace(/\\+"/g, '"');
 
+        if (!videoUrl) {
           const vMatch = cleaned.match(/"video_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
-            cleaned.match(/(https?:\/\/[^"'\s\\]+\.mp4[^"'\s\\]*)/);
+            cleaned.match(/"video_versions"\s*:\s*\[\s*\{\s*"url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+            cleaned.match(/(https?:\/\/[^"'\s\\]+?\.mp4[^"'\s\\]*)/i);
           if (vMatch) {
             videoUrl = vMatch[1];
           }
+        }
 
-          if (!thumbnailUrl) {
-            const dMatch = cleaned.match(/"display_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
-              cleaned.match(/(https?:\/\/[^"'\s\\]+\.jpg[^"'\s\\]*)/);
-            if (dMatch) {
-              thumbnailUrl = dMatch[1];
-            }
+        // Also extract from carousel items if post has multiple media items
+        if (!videoUrl) {
+          const carouselMatches = [...cleaned.matchAll(/(https?:\/\/[^"'\s\\]+?\.mp4[^"'\s\\]*)/gi)];
+          if (carouselMatches.length > 0) {
+            videoUrl = carouselMatches[0][1];
           }
         }
 
-        if (videoUrl || thumbnailUrl) {
-          const title = caption
-            ? caption.slice(0, 100)
-            : ogTitle
-            ? ogTitle.slice(0, 100)
-            : author
-            ? `Instagram post by @${author}`
-            : `Instagram Post (${shortcode})`;
+        if (!thumbnailUrl) {
+          const dMatch = cleaned.match(/"display_url"\s*:\s*"(https?:\/\/[^"]+)"/) ||
+            cleaned.match(/(https?:\/\/[^"'\s\\]+\.jpg[^"'\s\\]*)/);
+          if (dMatch) {
+            thumbnailUrl = dMatch[1];
+          }
+        }
 
+        const title = caption
+          ? caption.slice(0, 100)
+          : ogTitle
+          ? ogTitle.slice(0, 100)
+          : author
+          ? `Instagram post by @${author}`
+          : `Instagram Post (${shortcode})`;
+
+        if (videoUrl) {
+          // If video is found, immediately accept it
           extractedMedia = {
             videoUrl,
             thumbnailUrl,
@@ -217,10 +241,29 @@ export class InstagramAdapter extends BaseAdapter {
             surface: surface.name,
           };
           break;
+        } else if (thumbnailUrl) {
+          // Save thumbnail as fallback
+          if (!fallbackMedia) {
+            fallbackMedia = {
+              videoUrl: null,
+              thumbnailUrl,
+              title,
+              surface: surface.name,
+            };
+          }
+          // For regular posts, we can stop at image; for reels, continue checking other surfaces
+          if (!isReel) {
+            extractedMedia = fallbackMedia;
+            break;
+          }
         }
       } catch {
         // Try next surface
       }
+    }
+
+    if (!extractedMedia && fallbackMedia) {
+      extractedMedia = fallbackMedia;
     }
 
     if (!extractedMedia) {

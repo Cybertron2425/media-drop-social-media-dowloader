@@ -5,6 +5,7 @@ import { TikTokAdapter } from './tiktok.js';
 import { TwitterAdapter } from './twitter.js';
 import { ThreadsAdapter } from './threads.js';
 import { PublicMediaAdapter } from './publicMedia.js';
+import { YouTubeAdapter } from './youtubeAdapter.js';
 
 /**
  * Platform registry:
@@ -18,6 +19,7 @@ const adapters = [
   new TikTokAdapter(),
   new TwitterAdapter(),
   new ThreadsAdapter(),
+  new YouTubeAdapter(),
   new PublicMediaAdapter(),
 ];
 
