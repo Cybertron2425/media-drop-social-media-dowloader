@@ -1,4 +1,5 @@
-const BASE = (import.meta.env.VITE_API_URL || '') + '/api';
+const rawApiUrl = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+const BASE = (rawApiUrl ? rawApiUrl : '') + '/api';
 
 async function handle(res) {
   const data = await res.json().catch(() => ({ success: false, error: 'Something went wrong. Please try again.' }));

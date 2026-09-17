@@ -358,7 +358,7 @@ export class YouTubeAdapter extends BaseAdapter {
           'X-RapidAPI-Key': apiKey,
           Accept: 'application/json',
         },
-        timeout: 15000,
+        timeout: 30000,
         validateStatus: () => true,
       });
     } catch {

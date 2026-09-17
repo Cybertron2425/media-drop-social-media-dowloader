@@ -16,7 +16,7 @@ export async function downloadStream(url, options = {}) {
   try {
     response = await axios.get(targetUrl, {
       responseType: 'stream',
-      timeout: 15000,
+      timeout: 120000,
       maxRedirects: 3,
       beforeRedirect: (redirectOptions) => {
         const redirectUrl =

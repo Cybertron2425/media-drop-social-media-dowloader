@@ -11,10 +11,13 @@ const app = express();
 app.disable('x-powered-by');
 app.use(helmet());
 
-const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
+const configuredOrigins = (process.env.CLIENT_URL || '')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean);
+
+const defaultOrigins = ['http://localhost:5173', 'http://localhost:3000'];
+const allowedOrigins = Array.from(new Set([...defaultOrigins, ...configuredOrigins]));
 
 app.use(
   cors({

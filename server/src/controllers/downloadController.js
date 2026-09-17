@@ -93,7 +93,11 @@ export async function validateDownloadHandler(req, res) {
     }
   }
 
-  const requiresPrepare = false;
+  const requiresPrepare = Boolean(
+    token.meta?.audioUrl ||
+    token.platform === 'youtube' ||
+    token.meta?.needsMerge
+  );
 
   return res.json({
     success: true,
@@ -585,6 +589,8 @@ async function streamDownload(downloadId, req, res) {
     clearTimeout(stallTimer);
     console.error('[Download Controller Error]:', err);
     logEvent({ requestId: req.id, platform: token.platform, operation: 'download', durationMs: Date.now() - start, success: false });
+
+    if (res.headersSent) return;
 
     if (err instanceof PlatformLimitationError) {
       return res.status(422).json({ success: false, error: err.message });
