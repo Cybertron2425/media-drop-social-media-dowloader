@@ -347,6 +347,8 @@ export async function fetchWithProxy(url, options = {}) {
   for (let i = 0; i < attempts.length; i++) {
     const proxy = attempts[i];
     const proxyAgent = proxy ? new HttpsProxyAgent(proxy.url) : null;
+    const redirects = [];
+    let currentUrl = url;
     try {
       const config = {
         headers,
@@ -355,21 +357,41 @@ export async function fetchWithProxy(url, options = {}) {
         httpsAgent: proxyAgent,
         httpAgent: proxyAgent,
         validateStatus,
-        maxRedirects: 3,
+        maxRedirects: 5,
+        beforeRedirect: (redirectOptions, responseDetails) => {
+          const redirectUrl =
+            redirectOptions.href ||
+            `${redirectOptions.protocol}//${redirectOptions.hostname}${redirectOptions.path || ''}`;
+          redirects.push({
+            status: responseDetails?.statusCode || 302,
+            from: currentUrl,
+            to: redirectUrl,
+          });
+          currentUrl = redirectUrl;
+        },
         ...(options.responseType ? { responseType: options.responseType } : {}),
       };
       const res = method === 'GET'
         ? await axios.get(url, config)
         : await axios({ url, method, headers, data, ...config });
+
+      const finalUrl =
+        res.request?.res?.responseUrl ||
+        res.request?.responseURL ||
+        res.config?.url ||
+        url;
+
       return {
         data: res.data,
         status: res.status,
         headers: res.headers,
         proxy,
+        finalUrl,
+        redirects,
       };
     } catch (err) {
       lastError = err;
-      if (err.response?.status === 410 || err.response?.status === 404) {
+      if (err.response?.status === 410 || err.response?.status === 404 || err.response?.status === 470) {
         throw err;
       }
       if (i < attempts.length - 1) {

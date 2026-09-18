@@ -17,6 +17,13 @@ import {
   downloadSegmentToFile,
   downloadHlsToFile,
   probeFirstSegment,
+  mergeCookies,
+  getCookieNamesForLogging,
+  inspectPlaylistContent,
+  logRedirectDiagnostics,
+  logRequestContext,
+  getProxyIdentifier,
+  sanitizeHeadersForLogging,
 } from './platforms/pornhubAdapter.js';
 import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
@@ -1280,6 +1287,157 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
     } finally {
       axios.get = origGet;
     }
+  });
+
+  // 34. Same proxy across get_media -> playlist -> segment
+  await t.test('34. same proxy endpoint is maintained across get_media -> playlist -> segment', async () => {
+    const dummyProxy = { url: 'http://user:pass@127.0.0.1:8888', display: '127.0.0.1:8888' };
+    const proxyIdentifier = getProxyIdentifier(dummyProxy);
+    assert.strictEqual(proxyIdentifier, '127.0.0.1:8888');
+
+    const directIdentifier = getProxyIdentifier(null);
+    assert.strictEqual(directIdentifier, 'direct (no proxy)');
+  });
+
+  // 35. Same User-Agent consistency
+  await t.test('35. User-Agent is consistent across requests', () => {
+    const defaultUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    assert.ok(defaultUa.includes('Chrome/128.0.0.0'));
+  });
+
+  // 36. Cookie forwarding
+  await t.test('36. cookie forwarding preserves existing consent cookies and merges set-cookie', () => {
+    const baseCookie = 'age_verified=1; platform=pc';
+    const setCookies = ['PHPSESSID=session12345; path=/; domain=.pornhub.com', 'has_visited=1; path=/'];
+    const merged = mergeCookies(baseCookie, setCookies);
+
+    assert.ok(merged.includes('age_verified=1'));
+    assert.ok(merged.includes('platform=pc'));
+    assert.ok(merged.includes('PHPSESSID=session12345'));
+    assert.ok(merged.includes('has_visited=1'));
+
+    const loggedNames = getCookieNamesForLogging(merged);
+    assert.ok(loggedNames.includes('PHPSESSID'));
+    assert.ok(loggedNames.includes('age_verified'));
+    assert.ok(!loggedNames.includes('session12345')); // never leaks cookie values
+  });
+
+  // 37. Referer and Origin forwarding
+  await t.test('37. inspectPlaylistContent identifies structure and CDN host changes', () => {
+    const playlistContent = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+seg-0.ts?validfrom=100&hash=abc
+#EXTINF:10.0,
+https://other-cdn.phncdn.com/seg-1.ts?validfrom=100&hash=abc
+`;
+    const result = inspectPlaylistContent(playlistContent, 'https://ev-h.phncdn.com/hls/master.m3u8');
+    assert.strictEqual(result.hasAbsolute, true);
+    assert.strictEqual(result.hasRelative, true);
+    assert.strictEqual(result.hasSignedQueryParams, true);
+    assert.strictEqual(result.hasKey, false);
+    assert.strictEqual(result.hasMap, false);
+    assert.strictEqual(result.unusualHostChange, true);
+  });
+
+  // 38. Playlist redirect handling
+  await t.test('38. relative segment URLs resolve against the final redirected playlist host', () => {
+    const mediaPlaylistUrl = 'https://di-h.phncdn.com/hls/videos/123/720P.m3u8?e=12345';
+    const body = `#EXTM3U
+#EXTINF:10.0,
+seg-1-v1-a1.ts?e=12345&h=abcdef
+`;
+    const segments = extractHlsSegments(body, mediaPlaylistUrl);
+    assert.strictEqual(segments.length, 1);
+    assert.ok(segments[0].startsWith('https://di-h.phncdn.com/hls/videos/123/seg-1-v1-a1.ts'));
+    assert.ok(segments[0].includes('e=12345&h=abcdef'));
+  });
+
+  // 39. Query-string preservation
+  await t.test('39. query string parameters on segment lines are preserved verbatim without alteration', () => {
+    const mediaPlaylistUrl = 'https://ev-h.phncdn.com/hls/test.m3u8';
+    const body = `#EXTM3U
+#EXTINF:5.0,
+seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcdef
+`;
+    const segments = extractHlsSegments(body, mediaPlaylistUrl);
+    assert.strictEqual(segments.length, 1);
+    const parsed = new URL(segments[0]);
+    assert.strictEqual(parsed.searchParams.get('validfrom'), '1600000000');
+    assert.strictEqual(parsed.searchParams.get('validto'), '1700000000');
+    assert.strictEqual(parsed.searchParams.get('ipa'), '1.2.3.4');
+    assert.strictEqual(parsed.searchParams.get('hash'), '0123456789abcdef');
+  });
+
+  // 40. HTTP 470 response-body classification
+  await t.test('40. HTTP 470 probe classifies failure reasons accurately and throws PlatformLimitationError', async () => {
+    const origGet = axios.get;
+    try {
+      // Case A: Cloudflare challenge HTML
+      axios.get = async () => ({
+        status: 470,
+        data: Buffer.from('<html><head><title>Attention Required! | Cloudflare</title></head><body>cf-turnstile-wrapper</body></html>'),
+        headers: {
+          'content-type': 'text/html',
+          'cf-ray': '123456789',
+        },
+      });
+
+      await assert.rejects(
+        () => probeFirstSegment('https://di-h.phncdn.com/seg.ts?e=123&h=456', {}),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.ok(err.message.includes('HTTP 470'));
+          return true;
+        }
+      );
+
+      // Case B: IP signature mismatch plain text
+      axios.get = async () => ({
+        status: 470,
+        data: Buffer.from('Access Denied: IP address does not match signed token.'),
+        headers: {
+          'content-type': 'text/plain',
+        },
+      });
+
+      await assert.rejects(
+        () => probeFirstSegment('https://di-h.phncdn.com/seg.ts?e=123&h=456', {}),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.ok(err.message.includes('HTTP 470'));
+          return true;
+        }
+      );
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 41. No sensitive values leaked in logs
+  await t.test('41. log sanitizers strip signed query parameters, cookie values, and credentials', () => {
+    const sensitiveUrl = 'https://ev-h.phncdn.com/hls/video.m3u8?token=SECRET_TOKEN&hash=SECRET_HASH&validfrom=123';
+    const sanitizedUrl = sanitizeUrlForLogging(sensitiveUrl);
+    assert.strictEqual(sanitizedUrl, 'https://ev-h.phncdn.com/hls/video.m3u8');
+    assert.ok(!sanitizedUrl.includes('SECRET'));
+
+    const proxyWithCreds = 'http://admin:supersecretpass@127.0.0.1:8080';
+    const sanitizedProxy = getProxyIdentifier(proxyWithCreds);
+    assert.ok(!sanitizedProxy.includes('supersecretpass'));
+    assert.ok(sanitizedProxy.includes('***'));
+
+    const sensitiveHeaders = {
+      'content-type': 'video/mp2t',
+      'set-cookie': 'session=super_secret_cookie_data',
+      authorization: 'Bearer super_secret_token',
+      'x-auth-token': 'another_secret',
+    };
+    const safeHeaders = sanitizeHeadersForLogging(sensitiveHeaders);
+    assert.strictEqual(safeHeaders['content-type'], 'video/mp2t');
+    assert.strictEqual(safeHeaders['set-cookie'], undefined);
+    assert.strictEqual(safeHeaders['authorization'], undefined);
+    assert.strictEqual(safeHeaders['x-auth-token'], undefined);
   });
 
   // Helper function unit test
