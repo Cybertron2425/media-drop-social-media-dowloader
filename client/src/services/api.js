@@ -35,6 +35,28 @@ export async function analyzeUrl(url) {
 export async function downloadFormat(downloadId, onStage) {
   onStage?.('starting');
 
+  // Track 1: Direct client download for formats that don't need merging (e.g. YouTube 720p/360p).
+  // Bypasses backend entirely to avoid datacenter IP blocks from YouTube.
+  try {
+    const directRes = await fetch(`${BASE}/download/${downloadId}/direct-url`);
+    if (directRes.ok) {
+      const directData = await directRes.json().catch(() => ({}));
+      if (directData.success && directData.url) {
+        const a = document.createElement('a');
+        a.href = directData.url;
+        a.setAttribute('download', directData.filename || '');
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 1000);
+        onStage?.('complete');
+        return;
+      }
+    }
+  } catch {
+    // If direct-url check fails or throws, gracefully proceed to server-side flow
+  }
+
   // Short server-side validate check (confirms token, checks size limit upfront)
   const validateRes = await fetch(`${BASE}/download/${downloadId}/validate`);
   const validateData = await validateRes.json().catch(() => ({}));

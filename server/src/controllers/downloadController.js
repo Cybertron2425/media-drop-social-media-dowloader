@@ -10,6 +10,7 @@ import { PlatformLimitationError } from '../platforms/baseAdapter.js';
 import axios from 'axios';
 import { logEvent } from '../utils/logger.js';
 import { validateMediaFile } from '../utils/mediaValidator.js';
+import { downloadStream } from '../utils/streamDownloader.js';
 
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -50,6 +51,88 @@ function sanitizeErrorMessage(msg) {
     return 'Something went wrong. Please try again.';
   }
   return msg;
+}
+
+/**
+ * Shared helper to detect if a media download token requires server-side audio/video merging.
+ */
+export function checkNeedsMerge(token, reqBody = {}) {
+  const audioUrl = reqBody?.audioUrl || token?.meta?.audioUrl;
+  const isHighRes =
+    /(?:1080p|1440p|2160p|4k|8k)/i.test(token?.meta?.format || '') ||
+    /(?:1080p|1440p|2160p|4k|8k)/i.test(token?.meta?.resolution || '') ||
+    /(?:1080p|1440p|2160p|4k|8k)/i.test(token?.formatId || '') ||
+    /(?:1080p|1440p|2160p|4k|8k)/i.test(token?.meta?.quality || '');
+
+  return Boolean(
+    (audioUrl && isHighRes) ||
+    (audioUrl && token?.meta?.needsMerge) ||
+    (audioUrl && token?.platform === 'youtube') ||
+    (audioUrl && reqBody?.audioUrl)
+  );
+}
+
+/**
+ * Computes a sanitized, user-friendly filename from download token metadata.
+ */
+export function getComputedFilename(token) {
+  const meta = token?.meta || {};
+  const format = meta.format || (meta.mimeType?.includes('audio') ? 'm4a' : 'mp4');
+  let filename = `${token?.platform || 'media'}_download.${format}`;
+  if (meta.title) {
+    const base = meta.title
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .replace(/_+/g, '_')
+      .slice(0, 50)
+      .replace(/^_+|_+$/g, '');
+    if (base) filename = `${base}.${format}`;
+  }
+  return sanitizeFilename(filename);
+}
+
+/**
+ * Track 1: Client-side direct download endpoint for formats that don't need merging.
+ * Bypasses backend streaming entirely to avoid datacenter IP blocks (e.g. YouTube googlevideo.com).
+ */
+export async function directUrlHandler(req, res) {
+  const token = peekDownloadToken(req.params.downloadId);
+  if (!token) {
+    return res.status(404).json({ success: false, error: 'The media is no longer available.' });
+  }
+
+  // If size is already known and exceeds the configured limit, reject upfront
+  if (token.meta?.sizeBytes && token.meta.sizeBytes > MAX_FILE_SIZE_BYTES) {
+    return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+  }
+
+  // Check if this format requires audio/video merging or server preparation
+  const needsMerge = checkNeedsMerge(token, req.body);
+  if (needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
+    return res.json({
+      success: false,
+      requiresPrepare: true,
+      fallback: true,
+      error: 'Preparation and merging required for this format.',
+    });
+  }
+
+  const sourceUrl = token.sourceUrl || token.meta?.videoUrl;
+  if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl)) {
+    return res.json({
+      success: false,
+      requiresPrepare: true,
+      fallback: true,
+      error: 'Direct URL not available.',
+    });
+  }
+
+  const filename = getComputedFilename(token);
+  return res.json({
+    success: true,
+    requiresPrepare: false,
+    url: sourceUrl,
+    filename,
+  });
 }
 
 /**
@@ -96,7 +179,8 @@ export async function validateDownloadHandler(req, res) {
   const requiresPrepare = Boolean(
     token.meta?.audioUrl ||
     token.platform === 'youtube' ||
-    token.meta?.needsMerge
+    token.meta?.needsMerge ||
+    checkNeedsMerge(token)
   );
 
   return res.json({
@@ -135,22 +219,16 @@ async function pipeStreamToTempFile(stream, defaultExt = 'mp4', maxBytes = MAX_F
 
 /**
  * Downloads a remote URL (such as an audio track) to a temporary file on disk with proper extension.
+ * Reuses downloadStream to inherit proxy rotation, retry, and SSRF validation.
  */
 async function downloadUrlToTempFile(url, defaultExt = 'm4a', headers = {}, maxBytes = MAX_FILE_SIZE_BYTES) {
-  const response = await axios({
-    method: 'GET',
-    url,
-    responseType: 'stream',
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-      Accept: '*/*',
-      ...headers,
-    },
-    timeout: 30000,
+  const result = await downloadStream(url, {
+    sourceUrl: url,
+    meta: { headers },
   });
 
-  const ct = (response.headers['content-type'] || '').toLowerCase();
+  const stream = result.stream;
+  const ct = (result.mimeType || '').toLowerCase();
   let ext = defaultExt || 'm4a';
   if (ct.includes('audio/webm') || url.toLowerCase().includes('.webm')) {
     ext = 'webm';
@@ -167,18 +245,18 @@ async function downloadUrlToTempFile(url, defaultExt = 'm4a', headers = {}, maxB
 
   await new Promise((resolve, reject) => {
     const ws = fs.createWriteStream(filePath);
-    response.data.on('data', (chunk) => {
+    stream.on('data', (chunk) => {
       bytesWritten += chunk.length;
       if (bytesWritten > maxBytes) {
         ws.destroy();
-        response.data.destroy();
+        stream.destroy();
         reject(new Error('This file exceeds the maximum allowed download size.'));
       }
     });
-    response.data.pipe(ws);
+    stream.pipe(ws);
     ws.on('finish', resolve);
     ws.on('error', reject);
-    response.data.on('error', reject);
+    stream.on('error', reject);
   });
 
   return filePath;
@@ -279,17 +357,7 @@ export async function prepareDownloadHandler(req, res) {
 
     try {
       const audioUrl = req.body?.audioUrl || token.meta?.audioUrl;
-      const isHighRes = /(?:1080p|1440p|2160p|4k|8k)/i.test(token.meta?.format || '') ||
-        /(?:1080p|1440p|2160p|4k|8k)/i.test(token.meta?.resolution || '') ||
-        /(?:1080p|1440p|2160p|4k|8k)/i.test(token.formatId || '') ||
-        /(?:1080p|1440p|2160p|4k|8k)/i.test(token.meta?.quality || '');
-
-      const needsMerge = Boolean(
-        (audioUrl && isHighRes) ||
-        (audioUrl && token.meta?.needsMerge) ||
-        (audioUrl && token.platform === 'youtube') ||
-        (audioUrl && req.body?.audioUrl)
-      );
+      const needsMerge = checkNeedsMerge(token, req.body);
 
       if (needsMerge && audioUrl) {
         // 1. Obtain video file with proper .mp4 extension
@@ -456,17 +524,7 @@ async function streamDownload(downloadId, req, res) {
 
   try {
     const audioUrl = req.body?.audioUrl || token.meta?.audioUrl;
-    const isHighRes = /(?:1080p|1440p|2160p|4k|8k)/i.test(token.meta?.format || '') ||
-      /(?:1080p|1440p|2160p|4k|8k)/i.test(token.meta?.resolution || '') ||
-      /(?:1080p|1440p|2160p|4k|8k)/i.test(token.formatId || '') ||
-      /(?:1080p|1440p|2160p|4k|8k)/i.test(token.meta?.quality || '');
-
-    const needsMerge = Boolean(
-      (audioUrl && isHighRes) ||
-      (audioUrl && token.meta?.needsMerge) ||
-      (audioUrl && token.platform === 'youtube') ||
-      (audioUrl && req.body?.audioUrl)
-    );
+    const needsMerge = checkNeedsMerge(token, req.body);
 
     if (needsMerge && audioUrl) {
       const result = await adapter.download(token.sourceUrl, {

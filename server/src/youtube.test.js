@@ -255,14 +255,22 @@ test('YouTube adapter live endpoint connectivity for YouTube URL analysis', asyn
   }
 
   const adapter = new YouTubeAdapter();
-  const result = await adapter.analyze('https://www.youtube.com/watch?v=jNQXAC9IVRw');
+  try {
+    const result = await adapter.analyze('https://www.youtube.com/watch?v=jNQXAC9IVRw');
 
-  assert.equal(result.platform, 'youtube');
-  assert.ok(result.title);
-  assert.equal(result.type, 'video');
-  assert.ok(Array.isArray(result.formats) && result.formats.length > 0);
-  assert.ok(result.formats.some((f) => f.hasVideo && f.sourceUrl));
-  assert.ok(result.formats.some((f) => f.hasAudio && f.sourceUrl));
+    assert.equal(result.platform, 'youtube');
+    assert.ok(result.title);
+    assert.equal(result.type, 'video');
+    assert.ok(Array.isArray(result.formats) && result.formats.length > 0);
+    assert.ok(result.formats.some((f) => f.hasVideo && f.sourceUrl));
+    assert.ok(result.formats.some((f) => f.hasAudio && f.sourceUrl));
+  } catch (err) {
+    if (err.message?.includes('request limit has been reached')) {
+      t.skip('Skipping live YouTube API test: RapidAPI quota reached');
+      return;
+    }
+    throw err;
+  }
 });
 
 test('YouTube format mapping pairs video-only adaptive streams with best audio stream for FFmpeg merging', () => {
@@ -385,6 +393,198 @@ test('FFmpeg merge outputs [FFmpeg] logs and handles .mp4 video and .m4a audio e
     [vPath, aPath, oPath].forEach((f) => fs.promises.unlink(f).catch(() => {}));
   }
 });
+
+test('checkNeedsMerge helper accurately distinguishes formats requiring merge vs direct stream', async () => {
+  const { checkNeedsMerge } = await import('./controllers/downloadController.js');
+
+  // Format with high-res resolution and separate audioUrl -> needs merge
+  const highResToken = {
+    platform: 'youtube',
+    meta: {
+      resolution: '1080p',
+      audioUrl: 'https://rr---sn.googlevideo.com/audio',
+      needsMerge: true,
+    },
+  };
+  assert.equal(checkNeedsMerge(highResToken), true);
+
+  // 4K token without explicit needsMerge flag but has audioUrl and 4k quality
+  const fourKToken = {
+    platform: 'youtube',
+    meta: {
+      quality: '4K (2160p)',
+      audioUrl: 'https://rr---sn.googlevideo.com/audio',
+    },
+  };
+  assert.equal(checkNeedsMerge(fourKToken), true);
+
+  // 720p format with baked-in audio (no separate audioUrl) -> NO merge needed
+  const direct720pToken = {
+    platform: 'youtube',
+    meta: {
+      resolution: '720p',
+      quality: '720p',
+      format: 'mp4',
+      originalHasAudio: true,
+      needsMerge: false,
+    },
+  };
+  assert.equal(checkNeedsMerge(direct720pToken), false);
+
+  // 360p format with baked-in audio -> NO merge needed
+  const direct360pToken = {
+    platform: 'youtube',
+    meta: {
+      resolution: '360p',
+      quality: '360p',
+      format: 'mp4',
+    },
+  };
+  assert.equal(checkNeedsMerge(direct360pToken), false);
+
+  // Audio-only format -> NO merge needed
+  const audioOnlyToken = {
+    platform: 'youtube',
+    meta: {
+      format: 'm4a',
+      mimeType: 'audio/mp4',
+    },
+  };
+  assert.equal(checkNeedsMerge(audioOnlyToken), false);
+
+  // Format requesting merge via reqBody override
+  assert.equal(checkNeedsMerge(direct720pToken, { audioUrl: 'https://example.com/audio' }), true);
+});
+
+test('getComputedFilename generates clean user-friendly filenames', async () => {
+  const { getComputedFilename } = await import('./controllers/downloadController.js');
+
+  const token = {
+    platform: 'youtube',
+    meta: {
+      title: 'Amazing Song (Official Music Video) [4K]!',
+      format: 'mp4',
+    },
+  };
+  const filename = getComputedFilename(token);
+  assert.equal(filename.endsWith('.mp4'), true);
+  assert.ok(filename.includes('Amazing_Song'));
+  assert.ok(!/[!\[\]]/.test(filename));
+});
+
+test('GET /api/download/:downloadId/direct-url handler behavior', async () => {
+  const { directUrlHandler } = await import('./controllers/downloadController.js');
+  const { createDownloadToken } = await import('./services/downloadTokenStore.js');
+
+  // 1. Invalid / expired downloadId returns 404
+  let status404 = null;
+  let json404 = null;
+  await directUrlHandler(
+    { params: { downloadId: 'nonexistent-token' } },
+    {
+      status: (code) => {
+        status404 = code;
+        return { json: (d) => { json404 = d; } };
+      },
+    }
+  );
+  assert.equal(status404, 404);
+  assert.equal(json404.success, false);
+
+  // 2. Token needing merge returns requiresPrepare: true and fallback flag
+  const mergeTokenId = createDownloadToken({
+    platform: 'youtube',
+    sourceUrl: 'https://rr---sn.googlevideo.com/videoplayback?id=1080',
+    meta: {
+      title: 'Merged Video',
+      format: 'mp4',
+      resolution: '1080p',
+      audioUrl: 'https://rr---sn.googlevideo.com/audio',
+      needsMerge: true,
+    },
+  });
+
+  let jsonMerge = null;
+  await directUrlHandler(
+    { params: { downloadId: mergeTokenId } },
+    {
+      json: (d) => { jsonMerge = d; },
+    }
+  );
+  assert.equal(jsonMerge.success, false);
+  assert.equal(jsonMerge.requiresPrepare, true);
+  assert.equal(jsonMerge.fallback, true);
+
+  // 3. Token NOT needing merge returns direct URL and computed filename
+  const directTokenId = createDownloadToken({
+    platform: 'youtube',
+    sourceUrl: 'https://rr---sn.googlevideo.com/videoplayback?id=720direct',
+    meta: {
+      title: 'Direct 720p Video',
+      format: 'mp4',
+      resolution: '720p',
+      needsMerge: false,
+    },
+  });
+
+  let jsonDirect = null;
+  await directUrlHandler(
+    { params: { downloadId: directTokenId } },
+    {
+      json: (d) => { jsonDirect = d; },
+    }
+  );
+  assert.equal(jsonDirect.success, true);
+  assert.equal(jsonDirect.requiresPrepare, false);
+  assert.equal(jsonDirect.url, 'https://rr---sn.googlevideo.com/videoplayback?id=720direct');
+  assert.ok(jsonDirect.filename.includes('Direct_720p_Video'));
+});
+
+test('getProxyList parses PROXY_LIST, PROXY_HOST/PORT, and handles empty env', async () => {
+  const { getProxyList } = await import('./utils/streamDownloader.js');
+
+  const oldList = process.env.PROXY_LIST;
+  const oldHost = process.env.PROXY_HOST;
+  const oldPort = process.env.PROXY_PORT;
+  const oldUser = process.env.PROXY_USERNAME;
+  const oldPass = process.env.PROXY_PASSWORD;
+
+  try {
+    // 1. When no proxy env vars are set
+    delete process.env.PROXY_LIST;
+    delete process.env.PROXY_HOST;
+    delete process.env.PROXY_PORT;
+    delete process.env.PROXY_USERNAME;
+    delete process.env.PROXY_PASSWORD;
+    assert.deepEqual(getProxyList(), []);
+
+    // 2. Comma-separated PROXY_LIST with credentials
+    process.env.PROXY_LIST = '142.111.48.250:7030, 198.23.239.134:6540';
+    process.env.PROXY_USERNAME = 'user123';
+    process.env.PROXY_PASSWORD = 'pass!word';
+
+    const proxies = getProxyList();
+    assert.equal(proxies.length, 2);
+    assert.equal(proxies[0].display, '142.111.48.250:7030');
+    assert.ok(proxies[0].url.startsWith('http://user123:pass!word@142.111.48.250:7030'));
+    assert.ok(proxies[1].url.startsWith('http://user123:pass!word@198.23.239.134:6540'));
+
+    // 3. Fallback to PROXY_HOST and PROXY_PORT when PROXY_LIST is unset
+    delete process.env.PROXY_LIST;
+    process.env.PROXY_HOST = '1.2.3.4';
+    process.env.PROXY_PORT = '8080';
+    const singleProxy = getProxyList();
+    assert.equal(singleProxy.length, 1);
+    assert.equal(singleProxy[0].display, '1.2.3.4:8080');
+  } finally {
+    if (oldList !== undefined) process.env.PROXY_LIST = oldList; else delete process.env.PROXY_LIST;
+    if (oldHost !== undefined) process.env.PROXY_HOST = oldHost; else delete process.env.PROXY_HOST;
+    if (oldPort !== undefined) process.env.PROXY_PORT = oldPort; else delete process.env.PROXY_PORT;
+    if (oldUser !== undefined) process.env.PROXY_USERNAME = oldUser; else delete process.env.PROXY_USERNAME;
+    if (oldPass !== undefined) process.env.PROXY_PASSWORD = oldPass; else delete process.env.PROXY_PASSWORD;
+  }
+});
+
 
 
 

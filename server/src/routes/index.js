@@ -4,6 +4,7 @@ import {
   downloadHandler,
   downloadStreamHandler,
   validateDownloadHandler,
+  directUrlHandler,
   prepareDownloadHandler,
   streamPreparedHandler,
   bulkDownloadHandler,
@@ -31,6 +32,9 @@ router.post('/download/bulk', bulkDownloadLimiter, bulkDownloadHandler);
 router.post('/download/:downloadId/prepare', preparedDownloadLimiter, prepareDownloadHandler);
 // Phase 2: serves already-prepared file using single-use streamId token without rate-limit lockout.
 router.get('/stream/:streamId', streamPreparedHandler);
+
+// ── Direct download endpoint (bypasses server for formats not needing merge) ─
+router.get('/download/:downloadId/direct-url', preparedDownloadLimiter, directUrlHandler);
 
 // ── Legacy single-step download endpoints ───────────────────────────────────
 router.get('/download/:downloadId/validate', preparedDownloadLimiter, validateDownloadHandler);
