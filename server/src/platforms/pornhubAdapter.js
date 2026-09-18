@@ -108,6 +108,25 @@ function cleanText(value, fallback) {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+export function isUrlExpiredOrStale(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  try {
+    const u = new URL(urlStr);
+    const validTo = u.searchParams.get('validto') || u.searchParams.get('e');
+    if (validTo) {
+      const expSec = Number(validTo);
+      if (!isNaN(expSec) && expSec > 0) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        // Stale if expired or expiring within the next 15 seconds
+        if (nowSec >= expSec - 15) {
+          return true;
+        }
+      }
+    }
+  } catch {}
+  return false;
+}
+
 export function sanitizeUrlForLogging(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return 'unknown';
   try {
@@ -1463,12 +1482,22 @@ export class PornhubAdapter extends BaseAdapter {
     let formatIdx = 0;
 
     for (const [height, { progressiveDef, hlsDef }] of qualityMap.entries()) {
-      const isHls = Boolean(hlsDef);
-      const selectedDef = hlsDef || progressiveDef;
+      const isProgressiveAvailable = Boolean(
+        progressiveDef &&
+        typeof progressiveDef.videoUrl === 'string' &&
+        progressiveDef.videoUrl.trim() &&
+        !progressiveDef.videoUrl.includes('.m3u8')
+      );
+
+      const isHls = !isProgressiveAvailable;
+      const selectedDef = isProgressiveAvailable ? progressiveDef : hlsDef;
+      if (!selectedDef || !selectedDef.videoUrl) continue;
+
       const vUrl = selectedDef.videoUrl;
       const audioUrl = selectedDef.audioUrl && /^https?:\/\//i.test(selectedDef.audioUrl) ? selectedDef.audioUrl : null;
       const needsMerge = Boolean(audioUrl);
       const quality = `${height}p`;
+      const sourceType = isHls ? 'HLS' : 'PROGRESSIVE';
 
       formats.push({
         id: `ph-${formatIdx++}`,
@@ -1484,6 +1513,7 @@ export class PornhubAdapter extends BaseAdapter {
         hasVideo: true,
         needsMerge,
         isHls,
+        sourceType,
         meta: {
           title,
           quality,
@@ -1493,8 +1523,12 @@ export class PornhubAdapter extends BaseAdapter {
           audioUrl,
           needsMerge,
           isHls,
+          sourceType,
+          hasProgressive: isProgressiveAvailable,
+          hasHlsOnly: !isProgressiveAvailable && Boolean(hlsDef),
           getMediaUrl: remoteDef?.videoUrl || null,
           hlsUrl: hlsDef?.videoUrl || null,
+          progressiveUrl: progressiveDef?.videoUrl || null,
           hlsSource: selectedHlsSource,
           pageUrl,
           proxy: pageProxy,
@@ -1590,6 +1624,12 @@ export class PornhubAdapter extends BaseAdapter {
       `sourceOrigin: ${sourceOrigin}\n` +
       `sourcePath: ${sourcePath}`
     );
+
+    if (isHls && (options.meta?.hasHlsOnly === true || options.meta?.hasProgressive === false)) {
+      throw new PlatformLimitationError(
+        'This quality is available only as HLS and cannot be downloaded from the current server.'
+      );
+    }
 
     const executeDownload = async (targetUrl) => {
       if (isHls) {
@@ -1825,7 +1865,27 @@ export class PornhubAdapter extends BaseAdapter {
         }
       }
 
-      // Case 2: Progressive MP4 format (direct stream proxy via Render server's DIRECT internet connection)
+      // Case 2: Progressive MP4 format (direct stream via Render server's DIRECT internet connection)
+      let progOrigin = '';
+      let progPath = '';
+      try {
+        const parsed = new URL(targetUrl);
+        progOrigin = parsed.origin;
+        progPath = parsed.pathname;
+      } catch {
+        progOrigin = 'unknown';
+        progPath = targetUrl || 'unknown';
+      }
+
+      console.log(
+        `[Pornhub Progressive Download]\n` +
+        `quality: ${options.meta?.quality || 'unknown'}\n` +
+        `isHls: false\n` +
+        `sourceType: PROGRESSIVE\n` +
+        `sourceOrigin: ${progOrigin}\n` +
+        `sourcePath: ${progPath}`
+      );
+
       return await downloadStream(targetUrl, {
         ...options,
         platform: 'pornhub',
@@ -1844,19 +1904,27 @@ export class PornhubAdapter extends BaseAdapter {
     }
 
     // Case 2: Progressive MP4 format
-    if (options.meta?.getMediaUrl) {
+    const isStale = isUrlExpiredOrStale(sourceUrl);
+
+    if ((isStale || options.meta?.getMediaUrl) && options.meta?.getMediaUrl) {
       try {
         const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
           headers: {
             'User-Agent': DEFAULT_USER_AGENT,
             Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+            Origin: 'https://www.pornhub.com',
             Accept: 'application/json, text/javascript, */*; q=0.01',
+            Cookie: baseHeaders.Cookie,
           },
           proxy: false,
           direct: true,
           timeout: 6000,
           validateStatus: () => true,
         });
+
+        if (freshRes.headers?.['set-cookie']) {
+          baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, freshRes.headers['set-cookie']);
+        }
 
         if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
           const reqQuality = (options.meta?.quality || '').replace('p', '');
@@ -1875,6 +1943,37 @@ export class PornhubAdapter extends BaseAdapter {
       } catch {
         // If fresh check fails, proceed with existing sourceUrl
       }
+    } else if (isStale && !options.meta?.getMediaUrl && options.meta?.pageUrl) {
+      try {
+        const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
+          headers: baseHeaders,
+          proxy: false,
+          direct: true,
+          timeout: 8000,
+          validateStatus: () => true,
+        });
+        if (freshPageRes.status === 200 && typeof freshPageRes.data === 'string') {
+          const flashMatch = freshPageRes.data.match(/var\s+flashvars(?:_\w+)?\s*=\s*({.+?});/s);
+          if (flashMatch) {
+            const freshFlashvars = JSON.parse(flashMatch[1]);
+            const freshDefs = Array.isArray(freshFlashvars?.mediaDefinitions)
+              ? freshFlashvars.mediaDefinitions
+              : [];
+            const reqQuality = (options.meta?.quality || '').replace('p', '');
+            const match = freshDefs.find(
+              (d) =>
+                d &&
+                (String(d.quality) === reqQuality || String(d.height) === reqQuality) &&
+                typeof d.videoUrl === 'string' &&
+                d.videoUrl.includes('.mp4') &&
+                !d.videoUrl.includes('.m3u8')
+            );
+            if (match?.videoUrl) {
+              sourceUrl = match.videoUrl;
+            }
+          }
+        }
+      } catch {}
     }
 
     try {

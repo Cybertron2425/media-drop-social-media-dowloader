@@ -299,6 +299,14 @@ export async function downloadStream(url, options = {}) {
     }
 
     if (
+      isDirect ||
+      options.platform === 'pornhub' ||
+      err?.response?.status === 470
+    ) {
+      throw err;
+    }
+
+    if (
       err?.response?.status === 403 ||
       err?.response?.status === 404 ||
       err?.response?.status === 410 ||
