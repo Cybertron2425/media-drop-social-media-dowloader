@@ -152,12 +152,35 @@ export function logFfmpegFailure(hlsUrl, options, err, code, signal, stderrLines
 }
 
 /**
- * Inspects an HLS playlist body to determine if it is a master playlist or media playlist.
- * If it is a master playlist, resolves the appropriate variant media playlist URL.
+ * Resolves all media segment URLs from an HLS media playlist body.
+ * Relative URLs are resolved against mediaPlaylistUrl, preserving signed query strings.
  */
-export function parseHlsPlaylist(body, baseUrl) {
+export function extractHlsSegments(body, mediaPlaylistUrl) {
   if (typeof body !== 'string' || !body.includes('#EXTM3U')) {
-    return { isValid: false, type: 'invalid', mediaPlaylistUrl: null };
+    return [];
+  }
+  const lines = body.split('\n').map((l) => l.trim()).filter(Boolean);
+  const segments = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith('#')) {
+      try {
+        const resolved = new URL(line, mediaPlaylistUrl).toString();
+        segments.push(resolved);
+      } catch {}
+    }
+  }
+  return segments;
+}
+
+/**
+ * Inspects an HLS playlist body to determine if it is a master playlist or media playlist.
+ * If it is a master playlist, resolves the appropriate variant media playlist URL matching requestedQuality
+ * (or highest resolution/bandwidth variant), preserving signed query parameters.
+ */
+export function parseHlsPlaylist(body, baseUrl, requestedQuality = null) {
+  if (typeof body !== 'string' || !body.includes('#EXTM3U')) {
+    return { isValid: false, type: 'invalid', mediaPlaylistUrl: null, variants: [] };
   }
 
   const isMaster = body.includes('#EXT-X-STREAM-INF');
@@ -165,18 +188,51 @@ export function parseHlsPlaylist(body, baseUrl) {
 
   if (isMaster) {
     const lines = body.split('\n').map((l) => l.trim()).filter(Boolean);
-    let mediaUri = null;
+    const variants = [];
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].startsWith('#EXT-X-STREAM-INF') && lines[i + 1] && !lines[i + 1].startsWith('#')) {
-        mediaUri = lines[i + 1];
-        break;
+        const infLine = lines[i];
+        const uri = lines[i + 1];
+
+        const resMatch = infLine.match(/RESOLUTION=(\d+)x(\d+)/i);
+        const bwMatch = infLine.match(/BANDWIDTH=(\d+)/i);
+        const height = resMatch ? parseInt(resMatch[2], 10) : 0;
+        const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+
+        variants.push({ height, bandwidth, uri });
       }
     }
-    const resolvedUrl = mediaUri ? new URL(mediaUri, baseUrl).toString() : null;
+
+    let selectedUri = null;
+    const reqHeight = requestedQuality
+      ? parseInt(String(requestedQuality).replace(/\D/g, ''), 10) || 0
+      : 0;
+
+    if (reqHeight > 0) {
+      const match = variants.find((v) => v.height === reqHeight);
+      if (match) selectedUri = match.uri;
+    }
+
+    if (!selectedUri && variants.length > 0) {
+      variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+      selectedUri = variants[0].uri;
+    }
+
+    if (!selectedUri) {
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('#EXT-X-STREAM-INF') && lines[i + 1] && !lines[i + 1].startsWith('#')) {
+          selectedUri = lines[i + 1];
+          break;
+        }
+      }
+    }
+
+    const resolvedUrl = selectedUri ? new URL(selectedUri, baseUrl).toString() : null;
     return {
       isValid: Boolean(resolvedUrl),
       type: 'master',
       mediaPlaylistUrl: resolvedUrl,
+      variants,
     };
   }
 
@@ -185,35 +241,190 @@ export function parseHlsPlaylist(body, baseUrl) {
       isValid: true,
       type: 'media',
       mediaPlaylistUrl: baseUrl,
+      variants: [],
     };
   }
 
-  return { isValid: false, type: 'unknown', mediaPlaylistUrl: null };
+  return { isValid: false, type: 'unknown', mediaPlaylistUrl: null, variants: [] };
 }
 
 /**
- * Downloads and packages an HLS (.m3u8) stream into a valid MP4 container using FFmpeg.
- * Uses fluent-ffmpeg safely, captures error, stderr, exit code, and signal.
- * If FFmpeg exits with SIGSEGV or fails, logs detailed diagnostics without query params.
+ * Downloads an individual segment with retry & exponential backoff.
+ * Streams response directly to a temporary chunk file on disk (zero memory buffering).
  */
-export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
+export async function downloadSegmentToFile(segmentUrl, chunkFilePath, headers, retries = 3, signal = null) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    if (signal?.aborted) {
+      throw new Error('HLS download aborted.');
+    }
+    try {
+      const res = await fetchWithProxy(segmentUrl, {
+        headers,
+        timeout: 15000,
+        responseType: 'stream',
+        signal,
+        validateStatus: (s) => s === 200,
+      });
+
+      await new Promise((resolve, reject) => {
+        const outStream = fs.createWriteStream(chunkFilePath);
+        res.data.pipe(outStream);
+        outStream.on('finish', resolve);
+        outStream.on('error', reject);
+        res.data.on('error', reject);
+      });
+
+      const stat = await fs.promises.stat(chunkFilePath);
+      if (stat.size > 0) {
+        return;
+      }
+      throw new Error('Downloaded segment chunk is empty.');
+    } catch (err) {
+      lastErr = err;
+      try {
+        await fs.promises.unlink(chunkFilePath);
+      } catch {}
+
+      if (err.response?.status === 403 || err.response?.status === 404 || err.response?.status === 410) {
+        throw err;
+      }
+      if (attempt < retries) {
+        const delayMs = Math.min(500 * Math.pow(2, attempt - 1), 3000);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw new Error(`Failed to download segment after ${retries} attempts: ${lastErr?.message || 'Network error'}`);
+}
+
+/**
+ * Appends a source chunk file to an open destination stream without closing the destination stream.
+ */
+export function appendFileToStream(srcPath, destStream) {
+  return new Promise((resolve, reject) => {
+    const readStream = fs.createReadStream(srcPath);
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      readStream.removeListener('error', onError);
+      readStream.removeListener('end', onEnd);
+      destStream.removeListener('error', onError);
+    };
+
+    readStream.on('error', onError);
+    destStream.on('error', onError);
+    readStream.on('end', onEnd);
+    readStream.pipe(destStream, { end: false });
+  });
+}
+
+/**
+ * Downloads segments in parallel batches but streams them strictly IN ORDER to a local .ts file.
+ */
+export async function downloadSegmentsInOrder({
+  segmentUrls,
+  tempDir,
+  combinedTsPath,
+  headers,
+  concurrency = 6,
+  retries = 3,
+  signal = null,
+}) {
+  const combinedWriteStream = fs.createWriteStream(combinedTsPath);
+
+  const downloadedIndices = new Set();
+  let nextIndexToWrite = 0;
+  let writeError = null;
+
+  let writeLock = Promise.resolve();
+  const scheduleWrite = () => {
+    writeLock = writeLock.then(async () => {
+      while (downloadedIndices.has(nextIndexToWrite) && !writeError) {
+        const chunkPath = path.join(tempDir, `seg_${nextIndexToWrite}.ts`);
+        await appendFileToStream(chunkPath, combinedWriteStream);
+        await fs.promises.unlink(chunkPath).catch(() => {});
+        downloadedIndices.delete(nextIndexToWrite);
+        nextIndexToWrite++;
+      }
+    }).catch((err) => {
+      writeError = err;
+    });
+    return writeLock;
+  };
+
+  let currentIndex = 0;
+  const total = segmentUrls.length;
+
+  const worker = async () => {
+    while (currentIndex < total) {
+      if (writeError) throw writeError;
+      if (signal?.aborted) throw new Error('Download aborted by client.');
+
+      const idx = currentIndex++;
+      const segUrl = segmentUrls[idx];
+      const chunkPath = path.join(tempDir, `seg_${idx}.ts`);
+
+      await downloadSegmentToFile(segUrl, chunkPath, headers, retries, signal);
+
+      downloadedIndices.add(idx);
+      await scheduleWrite();
+    }
+  };
+
+  const activeConcurrency = Math.min(concurrency, total);
+  const workerPromises = [];
+  for (let w = 0; w < activeConcurrency; w++) {
+    workerPromises.push(worker());
+  }
+
+  await Promise.all(workerPromises);
+  await scheduleWrite();
+  await writeLock;
+
+  if (writeError) {
+    combinedWriteStream.destroy();
+    throw writeError;
+  }
+
+  if (nextIndexToWrite < total) {
+    combinedWriteStream.destroy();
+    throw new Error(`Incomplete download: wrote ${nextIndexToWrite}/${total} segments.`);
+  }
+
+  await new Promise((resolve, reject) => {
+    combinedWriteStream.on('finish', resolve);
+    combinedWriteStream.on('error', reject);
+    combinedWriteStream.end();
+  });
+}
+
+/**
+ * Runs FFmpeg strictly on a local .ts file with zero network calls.
+ * Repackages TS stream into an MP4 container with faststart.
+ */
+export function remuxTsToMp4WithFfmpeg(localTsPath, outputPath, options = {}) {
   return new Promise((resolve, reject) => {
     let finished = false;
     const timeoutMs = options.timeoutMs || 300000;
-    const userAgent = options.headers?.['User-Agent'] || DEFAULT_USER_AGENT;
-    const referer = options.headers?.['Referer'] || 'https://www.pornhub.com/';
-
-    const headerString = `User-Agent: ${userAgent}\r\nReferer: ${referer}\r\n`;
     const stderrLines = [];
+    const logLevel = process.env.FFMPEG_DEBUG === 'true' ? 'debug' : 'warning';
 
-    const command = ffmpeg(hlsUrl)
+    const command = ffmpeg(localTsPath)
       .inputOptions([
-        '-headers', headerString,
-        '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+        '-loglevel', logLevel,
       ])
       .outputOptions([
         '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
         '-movflags', '+faststart',
+        '-y',
       ])
       .output(outputPath);
 
@@ -232,9 +443,7 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
     const timer = setTimeout(() => {
       finished = true;
       killProcess();
-      const timeoutErr = new Error('FFmpeg HLS download timed out.');
-      logFfmpegFailure(hlsUrl, options, timeoutErr, null, null, stderrLines);
-      reject(timeoutErr);
+      reject(new Error('FFmpeg remuxing timed out.'));
     }, timeoutMs);
 
     command
@@ -248,7 +457,7 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
         clearTimeout(timer);
         killProcess();
 
-        logFfmpegFailure(hlsUrl, options, err, err.code, err.signal, stderrLines, stderr);
+        const completeStderr = stderrLines.length > 0 ? stderrLines.join('\n') : (stderr || err.message);
 
         const isSigsegv =
           err.message?.includes('SIGSEGV') ||
@@ -256,23 +465,141 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
           err.code === 'SIGSEGV' ||
           err.code === 139;
 
+        console.error('[FFmpeg Local Remux Error]:', {
+          isSigsegv,
+          code: err.code,
+          signal: err.signal,
+          stderr: completeStderr,
+        });
+
         if (isSigsegv) {
-          console.error('[FFmpeg SIGSEGV Error]: FFmpeg segmentation fault during HLS processing.');
           const sigsegvErr = new PlatformLimitationError(
-            'HLS processing failed on the server. Please try another quality.'
+            'Server media processing encountered an unexpected system error during remuxing.'
           );
           sigsegvErr.isSigsegv = true;
+          sigsegvErr.stderr = completeStderr;
           return reject(sigsegvErr);
         }
 
-        const lastErr = stderrLines.slice(-3).join(' ') || stderr || err.message;
-        const ffmpegErr = new Error(`FFmpeg HLS download failed: ${err.message} (${lastErr})`);
+        const ffmpegErr = new Error(`FFmpeg remux failed: ${err.message} (${completeStderr})`);
         ffmpegErr.originalError = err;
-        ffmpegErr.stderr = stderr || lastErr;
+        ffmpegErr.stderr = completeStderr;
         reject(ffmpegErr);
       })
       .run();
   });
+}
+
+/**
+ * Downloads an HLS playlist to disk using Node.js for network transport, then remuxes locally with FFmpeg.
+ * FFmpeg never accesses the network, preventing static build glibc/GnuTLS SIGSEGV crashes.
+ */
+export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
+  const headers = options.headers || {
+    'User-Agent': DEFAULT_USER_AGENT,
+    Referer: 'https://www.pornhub.com/',
+  };
+  const concurrency = options.concurrency || 6;
+  const retries = options.retries || 3;
+  const signal = options.signal || null;
+
+  // 1. Fetch playlist in Node
+  const playlistRes = await fetchWithProxy(playlistUrl, {
+    headers,
+    timeout: 10000,
+    validateStatus: () => true,
+  });
+
+  if (playlistRes.status !== 200 || typeof playlistRes.data !== 'string' || !playlistRes.data.includes('#EXTM3U')) {
+    if (playlistRes.status === 410 || playlistRes.status === 404) {
+      throw new PlatformLimitationError('The media stream is no longer available on Pornhub (HTTP 410).');
+    }
+    if (playlistRes.status === 403 || playlistRes.status === 401) {
+      throw new PlatformLimitationError('Access to this media stream was denied by Pornhub (HTTP 403).');
+    }
+    throw new PlatformLimitationError('Failed to fetch a valid HLS playlist.');
+  }
+
+  let mediaPlaylistBody = playlistRes.data;
+  let mediaPlaylistUrl = playlistUrl;
+
+  // 2. Resolve Master Playlist if needed
+  if (mediaPlaylistBody.includes('#EXT-X-STREAM-INF')) {
+    const parsed = parseHlsPlaylist(mediaPlaylistBody, playlistUrl, options.quality);
+    if (!parsed.isValid || !parsed.mediaPlaylistUrl) {
+      throw new PlatformLimitationError('Failed to resolve variant playlist from HLS master playlist.');
+    }
+    mediaPlaylistUrl = parsed.mediaPlaylistUrl;
+    if (mediaPlaylistUrl.includes('hv-h.phncdn.com')) {
+      mediaPlaylistUrl = mediaPlaylistUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+    }
+
+    const childRes = await fetchWithProxy(mediaPlaylistUrl, {
+      headers,
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+
+    if (childRes.status !== 200 || typeof childRes.data !== 'string' || !childRes.data.includes('#EXTM3U')) {
+      if (childRes.status === 410 || childRes.status === 404) {
+        throw new PlatformLimitationError('The media stream is no longer available on Pornhub (HTTP 410).');
+      }
+      if (childRes.status === 403 || childRes.status === 401) {
+        throw new PlatformLimitationError('Access to this media stream was denied by Pornhub (HTTP 403).');
+      }
+      throw new PlatformLimitationError('Failed to fetch variant HLS media playlist.');
+    }
+    mediaPlaylistBody = childRes.data;
+  }
+
+  // 3. Reject encrypted streams (#EXT-X-KEY)
+  if (mediaPlaylistBody.includes('#EXT-X-KEY')) {
+    throw new PlatformLimitationError('Encrypted HLS streams (#EXT-X-KEY) are not supported.');
+  }
+
+  // 4. Extract segment URLs
+  const segmentUrls = extractHlsSegments(mediaPlaylistBody, mediaPlaylistUrl);
+  if (segmentUrls.length === 0) {
+    throw new PlatformLimitationError('No playable segments found in HLS playlist.');
+  }
+
+  // 5. Create dedicated temporary directory
+  const tempDir = path.join(os.tmpdir(), `md_hls_${nanoid(8)}`);
+  await fs.promises.mkdir(tempDir, { recursive: true });
+  const combinedTsPath = path.join(tempDir, 'combined.ts');
+
+  try {
+    // 6. Download segments in parallel batches & stream to combined.ts in order
+    await downloadSegmentsInOrder({
+      segmentUrls,
+      tempDir,
+      combinedTsPath,
+      headers,
+      concurrency,
+      retries,
+      signal,
+    });
+
+    // 7. Remux combined .ts file to MP4 using FFmpeg locally (never touches network)
+    await remuxTsToMp4WithFfmpeg(combinedTsPath, outPath, options);
+
+    return outPath;
+  } catch (err) {
+    if (err.code === 'ENOSPC') {
+      throw new PlatformLimitationError('Server storage is currently full. Please try again later.');
+    }
+    throw err;
+  } finally {
+    // 8. Always clean up temporary directory and part files
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Backward-compatible wrapper delegating to downloadHlsToFile.
+ */
+export async function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
+  return await downloadHlsToFile(hlsUrl, outputPath, options);
 }
 
 export class PornhubAdapter extends BaseAdapter {
@@ -794,8 +1121,9 @@ export class PornhubAdapter extends BaseAdapter {
       // Safe to run FFmpeg immediately with verified fresh media playlist
       const tempFilePath = path.join(os.tmpdir(), `md_ph_hls_${nanoid(8)}.mp4`);
       try {
-        await downloadHlsWithFfmpeg(targetMediaUrl, tempFilePath, {
+        await downloadHlsToFile(targetMediaUrl, tempFilePath, {
           headers: baseHeaders,
+          quality: options.meta?.quality,
           preCheckStatus,
           playlistSnippet: verifiedPlaylistSnippet,
         });
@@ -832,6 +1160,9 @@ export class PornhubAdapter extends BaseAdapter {
           throw new PlatformLimitationError(
             'Access to this media stream was denied by Pornhub (HTTP 403).'
           );
+        }
+        if (err instanceof PlatformLimitationError) {
+          throw err;
         }
         throw new PlatformLimitationError(
           `Failed to download HLS video stream: ${err.message}`

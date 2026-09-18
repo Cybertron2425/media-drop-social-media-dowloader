@@ -356,6 +356,7 @@ export async function fetchWithProxy(url, options = {}) {
         httpAgent: proxyAgent,
         validateStatus,
         maxRedirects: 3,
+        ...(options.responseType ? { responseType: options.responseType } : {}),
       };
       const res = method === 'GET'
         ? await axios.get(url, config)

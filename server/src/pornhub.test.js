@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { Readable } from 'node:stream';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,6 +13,9 @@ import {
   parseIsoDuration,
   parseHlsPlaylist,
   sanitizeUrlForLogging,
+  extractHlsSegments,
+  downloadSegmentToFile,
+  downloadHlsToFile,
 } from './platforms/pornhubAdapter.js';
 import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
@@ -982,6 +986,115 @@ seg-1.ts
     assert.strictEqual(sanitized, 'https://ev-h.phncdn.com/hls/c1/videos/master.m3u8');
     assert.strictEqual(sanitized.includes('SECRET_HASH'), false);
     assert.strictEqual(sanitized.includes('12345678'), false);
+  });
+
+  // 26. extractHlsSegments resolves relative URLs and preserves signed query parameters
+  await t.test('26. extractHlsSegments resolves relative segment URLs with query strings preserved', () => {
+    const mediaBody = `
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+seg-1.ts?validfrom=100&validto=200&hash=abc
+#EXTINF:10.0,
+seg-2.ts?validfrom=100&validto=200&hash=abc
+#EXT-X-ENDLIST
+`;
+    const segments = extractHlsSegments(mediaBody, 'https://ev-h.phncdn.com/hls/video/index.m3u8?token=xyz');
+    assert.strictEqual(segments.length, 2);
+    assert.strictEqual(segments[0], 'https://ev-h.phncdn.com/hls/video/seg-1.ts?validfrom=100&validto=200&hash=abc');
+    assert.strictEqual(segments[1], 'https://ev-h.phncdn.com/hls/video/seg-2.ts?validfrom=100&validto=200&hash=abc');
+  });
+
+  // 27. parseHlsPlaylist resolves requested variant quality from master playlist
+  await t.test('27. parseHlsPlaylist resolves requested quality variant from master playlist', () => {
+    const masterBody = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360
+360p/index.m3u8?token=1
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p/index.m3u8?token=2
+#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080
+1080p/index.m3u8?token=3
+`;
+    const parsed720 = parseHlsPlaylist(masterBody, 'https://ev-h.phncdn.com/hls/video/master.m3u8', '720p');
+    assert.strictEqual(parsed720.isValid, true);
+    assert.strictEqual(parsed720.type, 'master');
+    assert.strictEqual(parsed720.mediaPlaylistUrl, 'https://ev-h.phncdn.com/hls/video/720p/index.m3u8?token=2');
+
+    const parsed1080 = parseHlsPlaylist(masterBody, 'https://ev-h.phncdn.com/hls/video/master.m3u8', '1080p');
+    assert.strictEqual(parsed1080.mediaPlaylistUrl, 'https://ev-h.phncdn.com/hls/video/1080p/index.m3u8?token=3');
+
+    // Default without quality selects highest
+    const parsedDefault = parseHlsPlaylist(masterBody, 'https://ev-h.phncdn.com/hls/video/master.m3u8', null);
+    assert.strictEqual(parsedDefault.mediaPlaylistUrl, 'https://ev-h.phncdn.com/hls/video/1080p/index.m3u8?token=3');
+  });
+
+  // 28. downloadSegmentToFile retries on transient failure with backoff and succeeds
+  await t.test('28. downloadSegmentToFile retries on transient network error and succeeds', async () => {
+    const origGet = axios.get;
+    let attempts = 0;
+    const tmpChunk = path.join(os.tmpdir(), `md_test_retry_${nanoid(8)}.ts`);
+
+    try {
+      axios.get = async (url, config) => {
+        if (url.includes('flaky-segment.ts')) {
+          attempts++;
+          if (attempts === 1) {
+            const err = new Error('Socket hang up');
+            err.code = 'ECONNRESET';
+            throw err;
+          }
+          return {
+            status: 200,
+            data: Readable.from(Buffer.from('SYNC_BYTE_MPEGTS_PAYLOAD')),
+          };
+        }
+        return origGet(url, config);
+      };
+
+      await downloadSegmentToFile('https://cdn.example.com/flaky-segment.ts', tmpChunk, {}, 3);
+      assert.strictEqual(attempts, 2, 'Must have retried once and succeeded on second attempt');
+      assert.strictEqual(fs.existsSync(tmpChunk), true);
+      const content = fs.readFileSync(tmpChunk).toString();
+      assert.strictEqual(content, 'SYNC_BYTE_MPEGTS_PAYLOAD');
+    } finally {
+      axios.get = origGet;
+      try {
+        await fs.promises.unlink(tmpChunk);
+      } catch {}
+    }
+  });
+
+  // 29. downloadHlsToFile rejects encrypted HLS streams with #EXT-X-KEY
+  await t.test('29. downloadHlsToFile throws PlatformLimitationError when stream has #EXT-X-KEY', async () => {
+    const origGet = axios.get;
+    const dummyOut = path.join(os.tmpdir(), `md_test_drm_${nanoid(8)}.mp4`);
+    try {
+      axios.get = async (url) => {
+        if (url.includes('encrypted.m3u8')) {
+          return {
+            status: 200,
+            data: '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:10.0,\nseg-1.ts',
+          };
+        }
+        return origGet(url);
+      };
+
+      await assert.rejects(
+        () => downloadHlsToFile('https://cdn.example.com/encrypted.m3u8', dummyOut),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.match(err.message, /Encrypted HLS streams \(#EXT-X-KEY\) are not supported/i);
+          return true;
+        }
+      );
+    } finally {
+      axios.get = origGet;
+      try {
+        await fs.promises.unlink(dummyOut);
+      } catch {}
+    }
   });
 
   // Helper function unit test
