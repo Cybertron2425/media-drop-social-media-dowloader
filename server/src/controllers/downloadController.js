@@ -107,10 +107,11 @@ export async function directUrlHandler(req, res) {
 
   // Check if this format requires audio/video merging or server preparation
   const needsMerge = checkNeedsMerge(token, req.body);
-  if (token.platform === 'pornhub' || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || token.meta?.isHls) {
+  const isHls = Boolean(token.meta?.isHls || token.sourceUrl?.includes('.m3u8'));
+  if (token.platform === 'pornhub' || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
     return res.json({
       success: false,
-      requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || token.meta?.isHls),
+      requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || isHls),
       fallback: true,
       error: 'Direct client-side URL not available.',
     });
@@ -151,7 +152,7 @@ export async function validateDownloadHandler(req, res) {
   }
 
   // For adapters with direct media stream URLs, perform an upstream HEAD check for size limit
-  if (token.meta?.videoUrl && !token.meta.sizeBytes) {
+  if (token.meta?.videoUrl && !token.meta.sizeBytes && !token.meta?.isHls) {
     try {
       const headers = {
         'User-Agent':
@@ -176,11 +177,12 @@ export async function validateDownloadHandler(req, res) {
     }
   }
 
+  const isHls = Boolean(token.meta?.isHls || token.sourceUrl?.includes('.m3u8'));
   const requiresPrepare = Boolean(
     token.meta?.audioUrl ||
     token.platform === 'youtube' ||
     token.meta?.needsMerge ||
-    token.meta?.isHls ||
+    isHls ||
     checkNeedsMerge(token)
   );
 

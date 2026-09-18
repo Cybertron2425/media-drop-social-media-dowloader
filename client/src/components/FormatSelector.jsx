@@ -44,6 +44,23 @@ export default function FormatSelector({ formats, mediaType, isHighlight, onDown
   const selectedFormat = formats.find((f) => f.downloadId === selectedDownloadId) || formats[0];
   const isMergeFormat = Boolean(selectedFormat?.needsMerge);
 
+  const handleDownloadClick = () => {
+    const effectiveDownloadId = selectedDownloadId || formats?.[0]?.downloadId;
+    console.log('[MediaDrop Download] button clicked');
+    console.log('[MediaDrop Download] downloadId:', effectiveDownloadId);
+    console.log('[MediaDrop Download] quality:', selectedFormat?.quality);
+
+    if (isBusy) {
+      console.warn('[MediaDrop Download] Click ignored: download is already in progress', { downloadingId, isBusy });
+      return;
+    }
+    if (!effectiveDownloadId) {
+      console.error('[MediaDrop Download] Click error: no downloadId available for selected format');
+      return;
+    }
+    onDownload(effectiveDownloadId);
+  };
+
   return (
     <div className="mt-4 pt-2 border-t border-slate-100 dark:border-slate-800">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -93,7 +110,7 @@ export default function FormatSelector({ formats, mediaType, isHighlight, onDown
         {/* Download Button */}
         <button
           id={`main-download-btn-${selectedDownloadId}`}
-          onClick={() => onDownload(selectedDownloadId)}
+          onClick={handleDownloadClick}
           disabled={isBusy}
           aria-label="Download media"
           className={`focus-ring inline-flex items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-sm font-medium transition-all shadow-sm w-full sm:w-auto shrink-0 ${

@@ -34,58 +34,81 @@ export async function analyzeUrl(url) {
  */
 export async function downloadFormat(downloadId, onStage) {
   onStage?.('starting');
+  console.log('[MediaDrop Download] downloadFormat started for downloadId:', downloadId);
+  console.log('[MediaDrop Download] API BASE URL:', BASE);
 
-  // Track 1: Direct client download for formats that don't need merging (e.g. YouTube 720p/360p).
-  // Bypasses backend entirely to avoid datacenter IP blocks from YouTube.
+  // Track 1: Direct client download for formats that don't need merging (e.g. YouTube 720p/360p or progressive MP4).
+  // Bypasses backend entirely to avoid datacenter IP blocks from CDN hosts.
+  let directData = null;
+  const directUrlEndpoint = `${BASE}/download/${downloadId}/direct-url`;
+  console.log('[MediaDrop Download] direct-url request:', directUrlEndpoint);
+
   try {
-    const directRes = await fetch(`${BASE}/download/${downloadId}/direct-url`);
-    if (directRes.ok) {
-      const directData = await directRes.json().catch(() => ({}));
-      if (directData.success && directData.url) {
-        const a = document.createElement('a');
-        a.href = directData.url;
-        a.setAttribute('download', directData.filename || '');
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => a.remove(), 1000);
-        onStage?.('complete');
-        return;
-      }
+    const directRes = await fetch(directUrlEndpoint);
+    directData = await directRes.json().catch(() => ({}));
+    console.log('[MediaDrop Download] direct-url response:', directData);
+    console.log('[MediaDrop Download] requiresPrepare:', directData?.requiresPrepare);
+
+    if (directData?.success && directData?.url) {
+      console.log('[MediaDrop Download] browser direct download:', directData.url);
+      const a = document.createElement('a');
+      a.href = directData.url;
+      a.setAttribute('download', directData.filename || '');
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 1000);
+      onStage?.('complete');
+      return;
     }
-  } catch {
-    // If direct-url check fails or throws, gracefully proceed to server-side flow
+  } catch (err) {
+    console.warn('[MediaDrop Download] direct-url check failed, falling back to server-side flow:', err);
   }
 
   // Short server-side validate check (confirms token, checks size limit upfront)
-  const validateRes = await fetch(`${BASE}/download/${downloadId}/validate`);
+  const validateEndpoint = `${BASE}/download/${downloadId}/validate`;
+  console.log('[MediaDrop Download] validate request:', validateEndpoint);
+  const validateRes = await fetch(validateEndpoint);
   const validateData = await validateRes.json().catch(() => ({}));
+  console.log('[MediaDrop Download] validate response:', validateData);
+  console.log('[MediaDrop Download] requiresPrepare:', validateData?.requiresPrepare);
 
-  if (!validateRes.ok || !validateData.success) {
-    throw new Error(validateData.error || 'Failed to prepare the download. Please try again.');
+  if (!validateRes.ok || !validateData?.success) {
+    const errMsg = validateData?.error || 'Failed to prepare the download. Please try again.';
+    console.error('[MediaDrop Download] validate failed:', errMsg);
+    throw new Error(errMsg);
   }
 
   if (validateData.requiresPrepare) {
     // Server-side prepare step if required by the adapter.
     onStage?.('processing');
-    const prepareRes = await fetch(`${BASE}/download/${downloadId}/prepare`, {
+    const prepareEndpoint = `${BASE}/download/${downloadId}/prepare`;
+    console.log('[MediaDrop Download] prepare request:', prepareEndpoint);
+    const prepareRes = await fetch(prepareEndpoint, {
       method: 'POST',
     });
     const prepareData = await prepareRes.json().catch(() => ({}));
-    if (!prepareRes.ok || !prepareData.success) {
-      throw new Error(prepareData.error || 'Failed to prepare the download. Please try again.');
+    console.log('[MediaDrop Download] prepare response:', prepareData);
+
+    if (!prepareRes.ok || !prepareData?.success) {
+      const errMsg = prepareData?.error || 'Failed to prepare the download. Please try again.';
+      console.error('[MediaDrop Download] prepare failed:', errMsg);
+      throw new Error(errMsg);
     }
     const { streamId } = prepareData;
     if (!streamId) {
+      console.error('[MediaDrop Download] Missing streamId in prepare response');
       throw new Error('Server did not return a valid stream token. Please try again.');
     }
 
     // Handoff: native browser download starts here. Frontend does NOT wait for the
     // file transfer to complete — the Download Manager handles it independently.
     const streamUrl = `${BASE}/stream/${streamId}`;
+    console.log('[MediaDrop Download] stream:', streamUrl);
+    console.log('[MediaDrop Download] browser download:', streamUrl);
     const a = document.createElement('a');
     a.href = streamUrl;
-    a.setAttribute('download', '');
+    a.setAttribute('download', prepareData.filename || '');
     a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
@@ -94,6 +117,8 @@ export async function downloadFormat(downloadId, onStage) {
     // Direct native browser streaming — no prepare step needed.
     // Server streams directly from upstream CDN to the browser's Download Manager.
     const downloadUrl = `${BASE}/download/${downloadId}`;
+    console.log('[MediaDrop Download] stream (direct server):', downloadUrl);
+    console.log('[MediaDrop Download] browser download:', downloadUrl);
     const a = document.createElement('a');
     a.href = downloadUrl;
     a.setAttribute('download', '');

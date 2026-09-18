@@ -28,16 +28,22 @@ router.post('/download-all', bulkDownloadLimiter, bulkDownloadHandler);
 router.post('/download/bulk', bulkDownloadLimiter, bulkDownloadHandler);
 
 // ── Two-phase download (browser frontend) ───────────────────────────────────
+// Phase 1: validate (support both GET and POST)
+router.get('/download/:downloadId/validate', preparedDownloadLimiter, validateDownloadHandler);
+router.post('/download/:downloadId/validate', preparedDownloadLimiter, validateDownloadHandler);
+
 // Phase 1: legitimate download-tokens bypass the restrictive 5/min limit; invalid tokens get throttled.
 router.post('/download/:downloadId/prepare', preparedDownloadLimiter, prepareDownloadHandler);
+
 // Phase 2: serves already-prepared file using single-use streamId token without rate-limit lockout.
 router.get('/stream/:streamId', streamPreparedHandler);
+router.get('/download/:streamId/stream', streamPreparedHandler);
 
 // ── Direct download endpoint (bypasses server for formats not needing merge) ─
 router.get('/download/:downloadId/direct-url', preparedDownloadLimiter, directUrlHandler);
+router.post('/download/:downloadId/direct-url', preparedDownloadLimiter, directUrlHandler);
 
 // ── Legacy single-step download endpoints ───────────────────────────────────
-router.get('/download/:downloadId/validate', preparedDownloadLimiter, validateDownloadHandler);
 router.get('/download/:downloadId', preparedDownloadLimiter, downloadStreamHandler);
 router.post('/download', downloadLimiter, downloadHandler);
 

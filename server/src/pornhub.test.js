@@ -1440,6 +1440,157 @@ seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcd
     assert.strictEqual(safeHeaders['x-auth-token'], undefined);
   });
 
+  // 42. Verify all click-to-download route endpoints and methods
+  await t.test('42. verifies GET/POST for direct-url, validate, prepare, and stream endpoints', async () => {
+    const { default: app } = await import('./app.js');
+    function makeRequest(server, options, bodyData = null) {
+      return new Promise((resolve, reject) => {
+        const address = server.address();
+        const port = address.port;
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port,
+            agent: false,
+            headers: {
+              Connection: 'close',
+              ...(options.headers || {}),
+            },
+            ...options,
+          },
+          (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+              const buffer = Buffer.concat(chunks);
+              resolve({
+                statusCode: res.statusCode,
+                headers: res.headers,
+                buffer,
+                json: () => JSON.parse(buffer.toString('utf8')),
+              });
+            });
+          }
+        );
+        req.on('error', reject);
+        if (bodyData) {
+          req.write(typeof bodyData === 'string' ? bodyData : JSON.stringify(bodyData));
+        }
+        req.end();
+      });
+    }
+
+    let server;
+    await new Promise((resolve) => {
+      server = app.listen(0, '127.0.0.1', resolve);
+    });
+
+    const origGet = axios.get;
+    const fakeData = Buffer.from('TEST_STREAM_CHUNK');
+    axios.get = async (url, config) => {
+      if (url.includes('view_video.php')) {
+        return {
+          status: 200,
+          data: `
+            <script>
+              var flashvars_777 = {
+                "video_title": "Route Verification Video",
+                "video_duration": 60,
+                "image_url": "https://cdn.example.com/thumb.jpg",
+                "mediaDefinitions": [
+                  {
+                    "format": "mp4",
+                    "quality": "720",
+                    "height": 720,
+                    "videoUrl": "https://ev.phncdn.com/720P_verify.mp4"
+                  }
+                ]
+              };
+            </script>
+          `,
+        };
+      }
+      if (url.includes('720P_verify.mp4')) {
+        return {
+          status: 200,
+          headers: {
+            'content-type': 'video/mp4',
+            'content-length': String(fakeData.length),
+          },
+          data: Readable.from([fakeData]),
+        };
+      }
+      return origGet(url, config);
+    };
+
+    try {
+      // 1. Analyze
+      const analyzeRes = await makeRequest(
+        server,
+        {
+          path: '/api/analyze',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        },
+        { url: 'https://www.pornhub.com/view_video.php?viewkey=verify123' }
+      );
+      assert.strictEqual(analyzeRes.statusCode, 200);
+      const data = analyzeRes.json();
+      const downloadId = data.formats[0].downloadId;
+      assert.ok(downloadId);
+
+      // 2. direct-url GET and POST
+      const directGet = await makeRequest(server, {
+        path: `/api/download/${downloadId}/direct-url`,
+        method: 'GET',
+      });
+      assert.strictEqual(directGet.statusCode, 200);
+      const directPost = await makeRequest(server, {
+        path: `/api/download/${downloadId}/direct-url`,
+        method: 'POST',
+      });
+      assert.strictEqual(directPost.statusCode, 200);
+
+      // 3. validate GET and POST
+      const validateGet = await makeRequest(server, {
+        path: `/api/download/${downloadId}/validate`,
+        method: 'GET',
+      });
+      assert.strictEqual(validateGet.statusCode, 200);
+      assert.strictEqual(validateGet.json().success, true);
+
+      const validatePost = await makeRequest(server, {
+        path: `/api/download/${downloadId}/validate`,
+        method: 'POST',
+      });
+      assert.strictEqual(validatePost.statusCode, 200);
+      assert.strictEqual(validatePost.json().success, true);
+
+      // 4. prepare POST
+      const prepareRes = await makeRequest(server, {
+        path: `/api/download/${downloadId}/prepare`,
+        method: 'POST',
+      });
+      assert.strictEqual(prepareRes.statusCode, 200);
+      const prepData = prepareRes.json();
+      assert.strictEqual(prepData.success, true);
+      const streamId = prepData.streamId;
+      assert.ok(streamId);
+
+      // 5. stream GET via /api/download/:streamId/stream
+      const streamRes = await makeRequest(server, {
+        path: `/api/download/${streamId}/stream`,
+        method: 'GET',
+      });
+      assert.strictEqual(streamRes.statusCode, 200);
+      assert.strictEqual(streamRes.headers['content-type'], 'video/mp4');
+    } finally {
+      axios.get = origGet;
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
+    }
+  });
+
   // Helper function unit test
   await t.test('Helper: parseIsoDuration correctly parses ISO 8601 strings', () => {
     assert.strictEqual(parseIsoDuration('PT10M30S'), 630);

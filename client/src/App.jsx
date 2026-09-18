@@ -44,17 +44,21 @@ export default function App() {
   }
 
   async function handleDownload(downloadId) {
-    if (downloadingId || isBulkDownloading) return;
+    console.log('[MediaDrop Download] handleDownload triggered for downloadId:', downloadId);
+    if (downloadingId || isBulkDownloading) {
+      console.warn('[MediaDrop Download] Click ignored: already downloading', { downloadingId, isBulkDownloading });
+      return;
+    }
     setDownloadingId(downloadId);
     setDownloadError('');
     try {
       await downloadFormat(downloadId, setDownloadStage);
-      // downloadFormat resolves immediately after the native browser download
-      // is triggered — file transfer continues independently in the Download Manager.
+      console.log('[MediaDrop Download] downloadFormat resolved successfully');
       setDownloadingId(null);
       setDownloadStage(null);
     } catch (err) {
-      setDownloadError(err.message);
+      console.error('[MediaDrop Download] downloadFormat failed:', err);
+      setDownloadError(err.message || 'Download failed. Please try again.');
       setDownloadingId(null);
       setDownloadStage(null);
     }
