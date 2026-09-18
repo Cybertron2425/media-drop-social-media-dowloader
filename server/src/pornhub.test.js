@@ -6,7 +6,13 @@ import path from 'node:path';
 import os from 'node:os';
 import { nanoid } from 'nanoid';
 import axios from 'axios';
-import { PornhubAdapter, extractVideoId, parseIsoDuration } from './platforms/pornhubAdapter.js';
+import {
+  PornhubAdapter,
+  extractVideoId,
+  parseIsoDuration,
+  parseHlsPlaylist,
+  sanitizeUrlForLogging,
+} from './platforms/pornhubAdapter.js';
 import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
 import { checkNeedsMerge, mergeMediaFiles } from './controllers/downloadController.js';
@@ -702,7 +708,7 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
       assert.strictEqual(result.formats.length, 1);
       assert.strictEqual(result.formats[0].quality, '480p');
       assert.strictEqual(result.formats[0].meta.isHls, true);
-      assert.strictEqual(result.formats[0].sourceUrl, 'https://hv-h.phncdn.com/hls/480P.mp4/master.m3u8');
+      assert.strictEqual(result.formats[0].sourceUrl, 'https://ev-h.phncdn.com/hls/480P.mp4/master.m3u8');
     } finally {
       axios.get = origGet;
     }
@@ -838,7 +844,7 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
 
     try {
       axios.get = async (url) => {
-        if (url === 'https://hv-h.phncdn.com/hls/stale.mp4/master.m3u8') {
+        if (url.includes('stale.mp4/master.m3u8')) {
           const err = new Error('Expired HLS token');
           err.response = { status: 410, data: 'expired token' };
           throw err;
@@ -860,11 +866,17 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
           `;
           return { status: 200, data: freshHtml };
         }
-        if (url === 'https://hv-h.phncdn.com/hls/fresh_720.mp4/master.m3u8') {
+        if (url.includes('fresh_720.mp4/master.m3u8')) {
           freshHlsVerified = true;
           return {
             status: 200,
             data: '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nindex.m3u8'
+          };
+        }
+        if (url.includes('index.m3u8')) {
+          return {
+            status: 200,
+            data: '#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nseg-1.ts'
           };
         }
         return origGet(url);
@@ -930,6 +942,46 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
     } catch {}
 
     assert.strictEqual(fs.existsSync(tmpFile), false, 'Temporary file must be deleted after cleanup');
+  });
+
+  // 24. parseHlsPlaylist distinguishes master vs media playlists and resolves child variant URL
+  await t.test('24. parseHlsPlaylist correctly distinguishes master vs media playlists', () => {
+    const masterContent = `
+#EXTM3U
+#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=3000000,RESOLUTION=1920x1080
+index-v1-a1.m3u8?token=123
+`;
+    const masterParsed = parseHlsPlaylist(masterContent, 'https://ev-h.phncdn.com/hls/test/master.m3u8');
+    assert.strictEqual(masterParsed.isValid, true);
+    assert.strictEqual(masterParsed.type, 'master');
+    assert.strictEqual(
+      masterParsed.mediaPlaylistUrl,
+      'https://ev-h.phncdn.com/hls/test/index-v1-a1.m3u8?token=123'
+    );
+
+    const mediaContent = `
+#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+seg-1.ts
+`;
+    const mediaParsed = parseHlsPlaylist(mediaContent, 'https://ev-h.phncdn.com/hls/test/index.m3u8');
+    assert.strictEqual(mediaParsed.isValid, true);
+    assert.strictEqual(mediaParsed.type, 'media');
+    assert.strictEqual(mediaParsed.mediaPlaylistUrl, 'https://ev-h.phncdn.com/hls/test/index.m3u8');
+
+    const invalidParsed = parseHlsPlaylist('<html>Error</html>', 'https://example.com');
+    assert.strictEqual(invalidParsed.isValid, false);
+    assert.strictEqual(invalidParsed.type, 'invalid');
+  });
+
+  // 25. sanitizeUrlForLogging strips query tokens and query parameters
+  await t.test('25. sanitizeUrlForLogging strips query parameters and temporary tokens', () => {
+    const sensitive = 'https://ev-h.phncdn.com/hls/c1/videos/master.m3u8?h=SECRET_HASH%3D&e=12345678&f=1';
+    const sanitized = sanitizeUrlForLogging(sensitive);
+    assert.strictEqual(sanitized, 'https://ev-h.phncdn.com/hls/c1/videos/master.m3u8');
+    assert.strictEqual(sanitized.includes('SECRET_HASH'), false);
+    assert.strictEqual(sanitized.includes('12345678'), false);
   });
 
   // Helper function unit test

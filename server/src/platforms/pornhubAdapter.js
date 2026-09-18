@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { nanoid } from 'nanoid';
 import { createRequire } from 'node:module';
-import { execFile } from 'node:child_process';
+import { execFile, execSync } from 'node:child_process';
 import ffmpegInstaller from 'ffmpeg-static';
 import { BaseAdapter, PlatformLimitationError } from './baseAdapter.js';
 import { downloadStream, fetchWithProxy } from '../utils/streamDownloader.js';
@@ -108,10 +108,93 @@ function cleanText(value, fallback) {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+export function sanitizeUrlForLogging(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return 'unknown';
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return rawUrl.split('?')[0];
+  }
+}
+
+let cachedFfmpegVersion = null;
+export function getFfmpegVersion(execPath) {
+  if (cachedFfmpegVersion) return cachedFfmpegVersion;
+  try {
+    cachedFfmpegVersion = execSync(`"${execPath}" -version`).toString().split('\n')[0].trim();
+  } catch {
+    cachedFfmpegVersion = 'unknown';
+  }
+  return cachedFfmpegVersion;
+}
+
+export function logFfmpegFailure(hlsUrl, options, err, code, signal, stderrLines, rawStderr) {
+  const execPath = ffmpegInstaller || 'system ffmpeg';
+  const version = getFfmpegVersion(execPath);
+  const sanitizedUrl = sanitizeUrlForLogging(hlsUrl);
+  const completeStderr = (stderrLines && stderrLines.length > 0)
+    ? stderrLines.join('\n')
+    : (rawStderr || 'none');
+  const completeErrMsg = err ? (err.message || String(err)) : 'none';
+
+  console.error('=== [FFmpeg Diagnostics Failure Report] ===');
+  console.error(`- FFmpeg executable path: ${execPath}`);
+  console.error(`- ffmpeg -version: ${version}`);
+  console.error(`- exact input URL hostname/path: ${sanitizedUrl}`);
+  console.error(`- HTTP status from playlist pre-check: ${options.preCheckStatus ?? 'N/A'}`);
+  console.error(`- first 500 characters of the verified playlist:\n${options.playlistSnippet ? options.playlistSnippet.slice(0, 500) : 'N/A'}`);
+  console.error(`- FFmpeg exit code: ${code ?? err?.code ?? 'N/A'}`);
+  console.error(`- FFmpeg signal: ${signal ?? err?.signal ?? 'N/A'}`);
+  console.error(`- complete stderr:\n${completeStderr}`);
+  console.error(`- complete error message: ${completeErrMsg}`);
+  console.error('===========================================');
+}
+
+/**
+ * Inspects an HLS playlist body to determine if it is a master playlist or media playlist.
+ * If it is a master playlist, resolves the appropriate variant media playlist URL.
+ */
+export function parseHlsPlaylist(body, baseUrl) {
+  if (typeof body !== 'string' || !body.includes('#EXTM3U')) {
+    return { isValid: false, type: 'invalid', mediaPlaylistUrl: null };
+  }
+
+  const isMaster = body.includes('#EXT-X-STREAM-INF');
+  const isMedia = body.includes('#EXTINF');
+
+  if (isMaster) {
+    const lines = body.split('\n').map((l) => l.trim()).filter(Boolean);
+    let mediaUri = null;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith('#EXT-X-STREAM-INF') && lines[i + 1] && !lines[i + 1].startsWith('#')) {
+        mediaUri = lines[i + 1];
+        break;
+      }
+    }
+    const resolvedUrl = mediaUri ? new URL(mediaUri, baseUrl).toString() : null;
+    return {
+      isValid: Boolean(resolvedUrl),
+      type: 'master',
+      mediaPlaylistUrl: resolvedUrl,
+    };
+  }
+
+  if (isMedia) {
+    return {
+      isValid: true,
+      type: 'media',
+      mediaPlaylistUrl: baseUrl,
+    };
+  }
+
+  return { isValid: false, type: 'unknown', mediaPlaylistUrl: null };
+}
+
 /**
  * Downloads and packages an HLS (.m3u8) stream into a valid MP4 container using FFmpeg.
  * Uses fluent-ffmpeg safely, captures error, stderr, exit code, and signal.
- * If FFmpeg exits with SIGSEGV, fails immediately without retrying and cleans up.
+ * If FFmpeg exits with SIGSEGV or fails, logs detailed diagnostics without query params.
  */
 export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
   return new Promise((resolve, reject) => {
@@ -136,7 +219,7 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
 
     command.on('stderr', (line) => {
       stderrLines.push(line);
-      if (stderrLines.length > 25) stderrLines.shift();
+      if (stderrLines.length > 50) stderrLines.shift();
     });
 
     const killProcess = () => {
@@ -149,7 +232,9 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
     const timer = setTimeout(() => {
       finished = true;
       killProcess();
-      reject(new Error('FFmpeg HLS download timed out.'));
+      const timeoutErr = new Error('FFmpeg HLS download timed out.');
+      logFfmpegFailure(hlsUrl, options, timeoutErr, null, null, stderrLines);
+      reject(timeoutErr);
     }, timeoutMs);
 
     command
@@ -162,6 +247,8 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
         finished = true;
         clearTimeout(timer);
         killProcess();
+
+        logFfmpegFailure(hlsUrl, options, err, err.code, err.signal, stderrLines, stderr);
 
         const isSigsegv =
           err.message?.includes('SIGSEGV') ||
@@ -428,17 +515,22 @@ export class PornhubAdapter extends BaseAdapter {
     }
 
     // Extract HLS definitions
-    const hlsDefs = rawDefinitions.filter(
-      (d) =>
-        d &&
-        typeof d.videoUrl === 'string' &&
-        /^https?:\/\//i.test(d.videoUrl) &&
-        !d.videoUrl.includes('/video/get_media') &&
-        (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
-    );
+    const hlsDefs = rawDefinitions
+      .filter(
+        (d) =>
+          d &&
+          typeof d.videoUrl === 'string' &&
+          /^https?:\/\//i.test(d.videoUrl) &&
+          !d.videoUrl.includes('/video/get_media') &&
+          (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+      )
+      .map((d) => ({
+        ...d,
+        videoUrl: d.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com'),
+      }));
 
     // Group definitions by quality height.
-    // Task 8: Prefer Progressive MP4 whenever Pornhub provides it (ev.phncdn.com, isHls: false).
+    // Prefer Progressive MP4 whenever Pornhub provides it (ev.phncdn.com, isHls: false).
     // HLS should only be used when no progressive MP4 exists.
     const qualityMap = new Map();
 
@@ -467,9 +559,12 @@ export class PornhubAdapter extends BaseAdapter {
         const height = Number(def.height || def.quality) || 0;
         if (height > 0) {
           const isHls = def.format === 'hls' || def.videoUrl.includes('.m3u8');
+          const normalizedDef = isHls
+            ? { ...def, videoUrl: def.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com') }
+            : def;
           const entry = qualityMap.get(height) || {};
-          if (isHls) entry.hlsDef = def;
-          else entry.progressiveDef = def;
+          if (isHls) entry.hlsDef = normalizedDef;
+          else entry.progressiveDef = normalizedDef;
           qualityMap.set(height, entry);
         }
       }
@@ -576,31 +671,82 @@ export class PornhubAdapter extends BaseAdapter {
     // Case 1: HLS format (only when progressive MP4 is not available)
     if (isHls) {
       let hlsUrl = sourceUrl;
+      if (hlsUrl.includes('hv-h.phncdn.com')) {
+        hlsUrl = hlsUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+      }
 
-      // Task 4: Before using FFmpeg:
-      // - Verify the HLS URL is actually a .m3u8 playlist.
-      // - Fetch/check the playlist through the existing proxy mechanism.
-      // - If the playlist returns 403/404/410, refresh the Pornhub media URL once.
-      // - Never pass an expired or invalid URL to FFmpeg.
-      let playlistVerified = false;
-      try {
-        const checkRes = await fetchWithProxy(hlsUrl, {
+      let preCheckStatus = null;
+      let verifiedPlaylistSnippet = null;
+      let targetMediaUrl = null;
+
+      // Helper to verify a URL and resolve if master playlist (Task 3 & 4)
+      const verifyAndResolve = async (candidateUrl) => {
+        let normalized = candidateUrl;
+        if (normalized.includes('hv-h.phncdn.com')) {
+          normalized = normalized.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+        }
+
+        const res = await fetchWithProxy(normalized, {
           headers: baseHeaders,
           timeout: 8000,
           validateStatus: () => true,
         });
 
-        if (
-          checkRes.status === 200 &&
-          typeof checkRes.data === 'string' &&
-          checkRes.data.includes('#EXTM3U')
-        ) {
-          playlistVerified = true;
+        if (res.status !== 200 || typeof res.data !== 'string' || !res.data.includes('#EXTM3U')) {
+          return null;
+        }
+
+        const parsed = parseHlsPlaylist(res.data, normalized);
+        if (!parsed.isValid) return null;
+
+        if (parsed.type === 'master') {
+          // Task 4: DO NOT directly use master playlist with -c copy. Resolve variant first.
+          let childUrl = parsed.mediaPlaylistUrl;
+          if (childUrl.includes('hv-h.phncdn.com')) {
+            childUrl = childUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+          }
+
+          // Verify child media playlist immediately (Task 8: short freshness window)
+          const childRes = await fetchWithProxy(childUrl, {
+            headers: baseHeaders,
+            timeout: 8000,
+            validateStatus: () => true,
+          });
+
+          if (
+            childRes.status === 200 &&
+            typeof childRes.data === 'string' &&
+            childRes.data.includes('#EXTM3U') &&
+            childRes.data.includes('#EXTINF')
+          ) {
+            return {
+              mediaUrl: childUrl,
+              status: childRes.status,
+              snippet: childRes.data.slice(0, 500),
+            };
+          }
+          return null;
+        } else if (parsed.type === 'media') {
+          return {
+            mediaUrl: normalized,
+            status: res.status,
+            snippet: res.data.slice(0, 500),
+          };
+        }
+        return null;
+      };
+
+      try {
+        const verified = await verifyAndResolve(hlsUrl);
+        if (verified) {
+          targetMediaUrl = verified.mediaUrl;
+          preCheckStatus = verified.status;
+          verifiedPlaylistSnippet = verified.snippet;
         }
       } catch {}
 
       // If playlist is expired, 403/404/410, or invalid, refresh via pageUrl once
-      if (!playlistVerified && options.meta?.pageUrl) {
+      if (!targetMediaUrl && options.meta?.pageUrl) {
         try {
           const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
             headers: baseHeaders,
@@ -627,18 +773,11 @@ export class PornhubAdapter extends BaseAdapter {
               );
 
               if (freshHlsMatch?.videoUrl) {
-                hlsUrl = freshHlsMatch.videoUrl;
-                const freshCheck = await fetchWithProxy(hlsUrl, {
-                  headers: baseHeaders,
-                  timeout: 8000,
-                  validateStatus: () => true,
-                });
-                if (
-                  freshCheck.status === 200 &&
-                  typeof freshCheck.data === 'string' &&
-                  freshCheck.data.includes('#EXTM3U')
-                ) {
-                  playlistVerified = true;
+                const freshVerified = await verifyAndResolve(freshHlsMatch.videoUrl);
+                if (freshVerified) {
+                  targetMediaUrl = freshVerified.mediaUrl;
+                  preCheckStatus = freshVerified.status;
+                  verifiedPlaylistSnippet = freshVerified.snippet;
                 }
               }
             }
@@ -646,17 +785,19 @@ export class PornhubAdapter extends BaseAdapter {
         } catch {}
       }
 
-      if (!playlistVerified) {
+      if (!targetMediaUrl) {
         throw new PlatformLimitationError(
           'The media stream is no longer available on Pornhub (HTTP 410).'
         );
       }
 
-      // Safe to run FFmpeg with verified fresh HLS playlist
+      // Safe to run FFmpeg immediately with verified fresh media playlist
       const tempFilePath = path.join(os.tmpdir(), `md_ph_hls_${nanoid(8)}.mp4`);
       try {
-        await downloadHlsWithFfmpeg(hlsUrl, tempFilePath, {
+        await downloadHlsWithFfmpeg(targetMediaUrl, tempFilePath, {
           headers: baseHeaders,
+          preCheckStatus,
+          playlistSnippet: verifiedPlaylistSnippet,
         });
 
         const stat = await fs.promises.stat(tempFilePath);
