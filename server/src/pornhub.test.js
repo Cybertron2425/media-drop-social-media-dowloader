@@ -15,6 +15,7 @@ import {
   sanitizeUrlForLogging,
   extractHlsSegments,
   downloadSegmentToFile,
+  downloadSegmentsInOrder,
   downloadHlsToFile,
   probeFirstSegment,
   mergeCookies,
@@ -29,6 +30,43 @@ import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
 import { checkNeedsMerge, mergeMediaFiles } from './controllers/downloadController.js';
 import { createDownloadToken } from './services/downloadTokenStore.js';
+
+function makeRequest(server, options, bodyData = null) {
+  return new Promise((resolve, reject) => {
+    const address = server.address();
+    const port = address.port;
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        agent: false,
+        headers: {
+          Connection: 'close',
+          ...(options.headers || {}),
+        },
+        ...options,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks);
+          resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            buffer,
+            json: () => JSON.parse(buffer.toString('utf8')),
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    if (bodyData) {
+      req.write(typeof bodyData === 'string' ? bodyData : JSON.stringify(bodyData));
+    }
+    req.end();
+  });
+}
 
 test('Pornhub Adapter - Complete Test Suite', async (t) => {
   const adapter = new PornhubAdapter();
@@ -1614,6 +1652,197 @@ seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcd
       if (server.closeAllConnections) server.closeAllConnections();
       await new Promise((res) => server.close(res));
     }
+  });
+
+  // 43. File-size limit error is preserved as HTTP 413
+  await t.test('43. File-size limit error is explicitly returned as HTTP 413', async () => {
+    const { default: app } = await import('./app.js');
+    const server = http.createServer(app);
+    await new Promise((res) => server.listen(0, res));
+    const token = createDownloadToken({
+      platform: 'pornhub',
+      formatId: 'test-size-limit',
+      sourceUrl: 'https://example.com/oversized.mp4',
+      meta: {
+        title: 'Oversized Video',
+        sizeBytes: 999999999999,
+      },
+    });
+
+    try {
+      const res = await makeRequest(server, {
+        path: `/api/download/${token}/validate`,
+        method: 'POST',
+      });
+      assert.strictEqual(res.statusCode, 413);
+      const data = res.json();
+      assert.strictEqual(data.success, false);
+      assert.strictEqual(data.error, 'This file exceeds the maximum allowed download size.');
+    } finally {
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
+    }
+  });
+
+  // 44. HTTP 470 CDN rejection is preserved as HTTP 422
+  await t.test('44. HTTP 470 CDN rejection is explicitly preserved as HTTP 422 in prepare controller', async () => {
+    const { default: app } = await import('./app.js');
+    const server = http.createServer(app);
+    await new Promise((res) => server.listen(0, res));
+
+    const token = createDownloadToken({
+      platform: 'pornhub',
+      formatId: 'test-470',
+      sourceUrl: 'https://example.com/video.mp4',
+      meta: {
+        title: '470 Video',
+        isHls: true,
+      },
+    });
+
+    const phAdapter = getAdapter('pornhub');
+    const origDownload = phAdapter.download;
+    phAdapter.download = async () => {
+      throw new PlatformLimitationError('Pornhub CDN rejected the HLS segment request (HTTP 470).');
+    };
+
+    try {
+      const res = await makeRequest(server, {
+        path: `/api/download/${token}/prepare`,
+        method: 'POST',
+      });
+      assert.strictEqual(res.statusCode, 422);
+      const data = res.json();
+      assert.strictEqual(data.success, false);
+      assert.strictEqual(data.error, 'Pornhub CDN rejected the HLS segment request (HTTP 470).');
+    } finally {
+      phAdapter.download = origDownload;
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
+    }
+  });
+
+  // 45. Connection timeout is preserved as HTTP 504
+  await t.test('45. Connection timeout is explicitly preserved as HTTP 504 in prepare controller', async () => {
+    const { default: app } = await import('./app.js');
+    const server = http.createServer(app);
+    await new Promise((res) => server.listen(0, res));
+
+    const token = createDownloadToken({
+      platform: 'pornhub',
+      formatId: 'test-timeout',
+      sourceUrl: 'https://example.com/video.mp4',
+      meta: {
+        title: 'Timeout Video',
+        isHls: true,
+      },
+    });
+
+    const phAdapter = getAdapter('pornhub');
+    const origDownload = phAdapter.download;
+    phAdapter.download = async () => {
+      throw new Error('Connection timed out while downloading video segment.');
+    };
+
+    try {
+      const res = await makeRequest(server, {
+        path: `/api/download/${token}/prepare`,
+        method: 'POST',
+      });
+      assert.strictEqual(res.statusCode, 504);
+      const data = res.json();
+      assert.strictEqual(data.success, false);
+      assert.strictEqual(data.error, 'Connection timed out while downloading video segment.');
+    } finally {
+      phAdapter.download = origDownload;
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
+    }
+  });
+
+  // 46. downloadSegmentsInOrder enforces maxBytes limit and stops early
+  await t.test('46. downloadSegmentsInOrder stops early when total segment size exceeds maxBytes', async () => {
+    const tempDir = path.join(os.tmpdir(), `test_hls_limit_${nanoid(6)}`);
+    await fs.promises.mkdir(tempDir, { recursive: true });
+    const combinedTsPath = path.join(tempDir, 'combined.ts');
+
+    const segmentUrls = [
+      'https://cdn.example.com/seg0.ts',
+      'https://cdn.example.com/seg1.ts',
+      'https://cdn.example.com/seg2.ts',
+      'https://cdn.example.com/seg3.ts',
+      'https://cdn.example.com/seg4.ts',
+    ];
+
+    const fakeChunk = Buffer.alloc(1000, 'A');
+    const origGet = axios.get;
+    axios.get = async () => {
+      return {
+        status: 200,
+        data: Readable.from([fakeChunk]),
+        headers: { 'content-type': 'video/mp2t' },
+      };
+    };
+
+    try {
+      await assert.rejects(
+        () => downloadSegmentsInOrder({
+          segmentUrls,
+          tempDir,
+          combinedTsPath,
+          headers: {},
+          concurrency: 2,
+          retries: 1,
+          maxBytes: 2500, // 2.5 KB limit
+        }),
+        (err) => {
+          assert.strictEqual(err.message, 'This file exceeds the maximum allowed download size.');
+          return true;
+        }
+      );
+    } finally {
+      axios.get = origGet;
+      await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  // 47. streamDownloader preserves specific errors without converting to generic source error
+  await t.test('47. streamDownloader preserves file-size, HTTP 470, and timeout errors', async () => {
+    const { downloadStream } = await import('./utils/streamDownloader.js');
+    const origGet = axios.get;
+
+    // A. File size limit error
+    axios.get = async () => {
+      throw new Error('This file exceeds the maximum allowed download size.');
+    };
+    await assert.rejects(
+      () => downloadStream('https://example.com/test.mp4'),
+      (err) => err.message === 'This file exceeds the maximum allowed download size.'
+    );
+
+    // B. HTTP 470 error
+    axios.get = async () => {
+      const err = new Error('Request failed with status code 470');
+      err.response = { status: 470, headers: {} };
+      throw err;
+    };
+    await assert.rejects(
+      () => downloadStream('https://example.com/test.mp4'),
+      (err) => err.response?.status === 470
+    );
+
+    // C. Timeout error
+    axios.get = async () => {
+      const err = new Error('timeout of 30000ms exceeded');
+      err.code = 'ECONNABORTED';
+      throw err;
+    };
+    await assert.rejects(
+      () => downloadStream('https://example.com/test.mp4'),
+      (err) => err.code === 'ECONNABORTED'
+    );
+
+    axios.get = origGet;
   });
 
   // Helper function unit test

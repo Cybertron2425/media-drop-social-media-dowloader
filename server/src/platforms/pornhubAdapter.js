@@ -667,18 +667,28 @@ export async function downloadSegmentsInOrder({
   signal = null,
   proxy = null,
   preDownloadedChunk = null,
+  maxBytes = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 500) * 1024 * 1024,
 }) {
   const combinedWriteStream = fs.createWriteStream(combinedTsPath);
 
   const downloadedIndices = new Set();
   let nextIndexToWrite = 0;
   let writeError = null;
+  let totalBytesWritten = 0;
 
   let writeLock = Promise.resolve();
   const scheduleWrite = () => {
     writeLock = writeLock.then(async () => {
       while (downloadedIndices.has(nextIndexToWrite) && !writeError) {
         const chunkPath = path.join(tempDir, `seg_${nextIndexToWrite}.ts`);
+        const chunkStat = await fs.promises.stat(chunkPath).catch(() => null);
+        if (chunkStat) {
+          totalBytesWritten += chunkStat.size;
+          if (totalBytesWritten > maxBytes) {
+            writeError = new Error('This file exceeds the maximum allowed download size.');
+            break;
+          }
+        }
         await appendFileToStream(chunkPath, combinedWriteStream);
         await fs.promises.unlink(chunkPath).catch(() => {});
         downloadedIndices.delete(nextIndexToWrite);
@@ -715,6 +725,7 @@ export async function downloadSegmentsInOrder({
 
       downloadedIndices.add(idx);
       await scheduleWrite();
+      if (writeError) throw writeError;
     }
   };
 
@@ -1788,6 +1799,16 @@ export class PornhubAdapter extends BaseAdapter {
         } catch {
           // Fall through to error handler
         }
+      }
+
+      if (err.message?.includes('exceeds the maximum allowed download size')) {
+        throw err;
+      }
+      if (status === 470 || err.message?.includes('HTTP 470')) {
+        throw new PlatformLimitationError('Pornhub CDN rejected the HLS segment request (HTTP 470).');
+      }
+      if (err.message?.includes('timed out while downloading video segment')) {
+        throw err;
       }
 
       if (status === 403 || status === 471) {

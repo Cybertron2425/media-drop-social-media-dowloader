@@ -458,6 +458,34 @@ export async function prepareDownloadHandler(req, res) {
     console.error('[Prepare Controller Error]:', err);
     logEvent({ requestId: req.id, platform: token.platform, operation: 'prepare', durationMs: Date.now() - start, success: false });
 
+    // 1. File size limit exceeded -> HTTP 413
+    if (err.message && err.message.includes('exceeds the maximum allowed download size')) {
+      return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+    }
+
+    // 2. HTTP 470 CDN rejection -> HTTP 422
+    if (err.message && (err.message.includes('HTTP 470') || err.response?.status === 470)) {
+      return res.status(422).json({
+        success: false,
+        error: 'Pornhub CDN rejected the HLS segment request (HTTP 470).',
+      });
+    }
+
+    // 3. Segment timeout -> HTTP 504
+    if (
+      (err.message && (
+        err.message.includes('timed out while downloading video segment') ||
+        err.message.includes('Connection timed out')
+      )) ||
+      err.code === 'ETIMEDOUT' ||
+      err.code === 'ECONNABORTED'
+    ) {
+      return res.status(504).json({
+        success: false,
+        error: 'Connection timed out while downloading video segment.',
+      });
+    }
+
     if (err instanceof PlatformLimitationError) {
       return res.status(422).json({ success: false, error: err.message });
     }
@@ -670,6 +698,34 @@ async function streamDownload(downloadId, req, res) {
     logEvent({ requestId: req.id, platform: token.platform, operation: 'download', durationMs: Date.now() - start, success: false });
 
     if (res.headersSent) return;
+
+    // 1. File size limit exceeded -> HTTP 413
+    if (err.message && err.message.includes('exceeds the maximum allowed download size')) {
+      return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
+    }
+
+    // 2. HTTP 470 CDN rejection -> HTTP 422
+    if (err.message && (err.message.includes('HTTP 470') || err.response?.status === 470)) {
+      return res.status(422).json({
+        success: false,
+        error: 'Pornhub CDN rejected the HLS segment request (HTTP 470).',
+      });
+    }
+
+    // 3. Segment timeout -> HTTP 504
+    if (
+      (err.message && (
+        err.message.includes('timed out while downloading video segment') ||
+        err.message.includes('Connection timed out')
+      )) ||
+      err.code === 'ETIMEDOUT' ||
+      err.code === 'ECONNABORTED'
+    ) {
+      return res.status(504).json({
+        success: false,
+        error: 'Connection timed out while downloading video segment.',
+      });
+    }
 
     if (err instanceof PlatformLimitationError) {
       return res.status(422).json({ success: false, error: err.message });

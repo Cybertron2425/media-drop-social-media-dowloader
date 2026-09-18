@@ -238,6 +238,12 @@ export async function downloadStream(url, options = {}) {
       if (err.message === 'This URL cannot be processed.' || err.message === PROXY_TIMEOUT_ERROR_MESSAGE) {
         throw err;
       }
+      if (err.message?.includes('exceeds the maximum allowed download size')) {
+        throw err;
+      }
+      if (err.response?.status === 470 || err.message?.includes('HTTP 470')) {
+        throw err;
+      }
       // HTTP 410 (Gone / Expired) and HTTP 404 (Not Found) indicate the upstream resource itself
       // is unavailable or has an expired token. Retrying 10 other proxies will not make an expired
       // or missing resource valid; fail fast.
@@ -274,6 +280,23 @@ export async function downloadStream(url, options = {}) {
     console.error(
       `[DownloadStream Error] target=${targetUrl.slice(0, 80)} status=${err?.response?.status} contentType=${err?.response?.headers?.['content-type']} code=${err?.code} err=${err?.message}`
     );
+
+    // Preserve specific error types without converting them into generic source error
+    if (err?.message?.includes('exceeds the maximum allowed download size')) {
+      throw err;
+    }
+    if (err?.response?.status === 470 || err?.message?.includes('HTTP 470')) {
+      throw err;
+    }
+    if (
+      err?.code === 'ETIMEDOUT' ||
+      err?.code === 'ECONNABORTED' ||
+      err?.message?.includes('timed out') ||
+      err?.message?.includes('timeout')
+    ) {
+      throw err;
+    }
+
     if (
       err?.response?.status === 403 ||
       err?.response?.status === 404 ||
@@ -398,6 +421,9 @@ export async function fetchWithProxy(url, options = {}) {
     } catch (err) {
       lastError = err;
       if (err.response?.status === 410 || err.response?.status === 404 || err.response?.status === 470) {
+        throw err;
+      }
+      if (err.message?.includes('exceeds the maximum allowed download size')) {
         throw err;
       }
       if (i < attempts.length - 1) {
