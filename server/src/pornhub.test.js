@@ -594,6 +594,212 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
     }
   });
 
+  // 16. Prefer progressive MP4 over HLS
+  await t.test('16. Quality mapping prefers progressive MP4 over HLS and excludes get_media endpoint', async () => {
+    const origGet = axios.get;
+    try {
+      axios.get = async (url) => {
+        if (url.includes('view_video.php')) {
+          const sampleHtml = `
+            <script>
+              var flashvars_999 = {
+                "video_title": "Multi Format Video",
+                "video_duration": 120,
+                "image_url": "https://cdn.example.com/thumb.jpg",
+                "mediaDefinitions": [
+                  {
+                    "format": "hls",
+                    "quality": "720",
+                    "height": 720,
+                    "videoUrl": "https://hv-h.phncdn.com/hls/720P.mp4/master.m3u8"
+                  },
+                  {
+                    "format": "hls",
+                    "quality": "240",
+                    "height": 240,
+                    "videoUrl": "https://hv-h.phncdn.com/hls/240P.mp4/master.m3u8"
+                  },
+                  {
+                    "format": "mp4",
+                    "quality": [],
+                    "videoUrl": "https://www.pornhub.org/video/get_media?s=token123",
+                    "remote": true
+                  }
+                ]
+              };
+            </script>
+          `;
+          return { status: 200, data: sampleHtml };
+        }
+        if (url.includes('/video/get_media')) {
+          return {
+            status: 200,
+            data: [
+              {
+                format: 'mp4',
+                quality: '720',
+                height: 720,
+                videoUrl: 'https://ev.phncdn.com/720P_progressive.mp4?validto=123'
+              },
+              {
+                format: 'mp4',
+                quality: '240',
+                height: 240,
+                videoUrl: 'https://ev.phncdn.com/240P_progressive.mp4?validto=123'
+              }
+            ]
+          };
+        }
+        return origGet(url);
+      };
+
+      const result = await adapter.analyze('https://www.pornhub.com/view_video.php?viewkey=multiformat123');
+      assert.strictEqual(result.formats.length, 2);
+      assert.strictEqual(result.formats[0].quality, '720p');
+      assert.strictEqual(result.formats[0].sourceUrl, 'https://ev.phncdn.com/720P_progressive.mp4?validto=123');
+      assert.strictEqual(result.formats[0].meta.isHls, false);
+      assert.strictEqual(result.formats[1].quality, '240p');
+      assert.strictEqual(result.formats[1].sourceUrl, 'https://ev.phncdn.com/240P_progressive.mp4?validto=123');
+      assert.strictEqual(result.formats[1].meta.isHls, false);
+
+      // Verify /video/get_media was NEVER added as a downloadable format
+      const hasGetMedia = result.formats.some(f => f.sourceUrl.includes('/video/get_media'));
+      assert.strictEqual(hasGetMedia, false);
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 17. Fallback to HLS when only HLS is available
+  await t.test('17. Fallback to HLS with isHls=true when only HLS is available', async () => {
+    const origGet = axios.get;
+    try {
+      axios.get = async (url) => {
+        if (url.includes('view_video.php')) {
+          const sampleHtml = `
+            <script>
+              var flashvars_888 = {
+                "video_title": "HLS Only Video",
+                "video_duration": 60,
+                "image_url": "https://cdn.example.com/thumb.jpg",
+                "mediaDefinitions": [
+                  {
+                    "format": "hls",
+                    "quality": "480",
+                    "height": 480,
+                    "videoUrl": "https://hv-h.phncdn.com/hls/480P.mp4/master.m3u8"
+                  }
+                ]
+              };
+            </script>
+          `;
+          return { status: 200, data: sampleHtml };
+        }
+        return origGet(url);
+      };
+
+      const result = await adapter.analyze('https://www.pornhub.com/view_video.php?viewkey=hlsonly123');
+      assert.strictEqual(result.formats.length, 1);
+      assert.strictEqual(result.formats[0].quality, '480p');
+      assert.strictEqual(result.formats[0].meta.isHls, true);
+      assert.strictEqual(result.formats[0].sourceUrl, 'https://hv-h.phncdn.com/hls/480P.mp4/master.m3u8');
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 18. HTTP 410 handling fails fast and reports PlatformLimitationError
+  await t.test('18. HTTP 410 download failure throws PlatformLimitationError immediately', async () => {
+    const origGet = axios.get;
+    try {
+      axios.get = async () => {
+        const err = new Error('Request failed with status code 410');
+        err.response = { status: 410, data: 'expired token' };
+        throw err;
+      };
+
+      await assert.rejects(
+        adapter.download('https://ev.phncdn.com/expired.mp4', {
+          meta: { title: 'Expired Stream', isHls: false }
+        }),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.match(err.message, /no longer available on Pornhub|HTTP 410/i);
+          return true;
+        }
+      );
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 19. Stale URL refresh on HTTP 410
+  await t.test('19. Stale/expired URL auto-refreshes via getMediaUrl on HTTP 410', async () => {
+    const origGet = axios.get;
+    let initialCallMade = false;
+    let refreshCallMade = false;
+    let freshDownloadMade = false;
+
+    try {
+      axios.get = async (url) => {
+        if (url === 'https://ev.phncdn.com/stale_240p.mp4') {
+          initialCallMade = true;
+          const err = new Error('Expired');
+          err.response = { status: 410, data: 'expired token' };
+          throw err;
+        }
+        if (url.includes('/video/get_media')) {
+          refreshCallMade = true;
+          return {
+            status: 200,
+            data: [
+              {
+                format: 'mp4',
+                quality: '240',
+                height: 240,
+                videoUrl: 'https://ev.phncdn.com/fresh_240p.mp4'
+              }
+            ]
+          };
+        }
+        if (url === 'https://ev.phncdn.com/fresh_240p.mp4') {
+          freshDownloadMade = true;
+          const { Readable } = await import('node:stream');
+          const stream = new Readable({
+            read() {
+              this.push(Buffer.from('fresh video chunk'));
+              this.push(null);
+            }
+          });
+          return {
+            status: 200,
+            headers: {
+              'content-type': 'video/mp4',
+              'content-length': '17'
+            },
+            data: stream
+          };
+        }
+        return origGet(url);
+      };
+
+      const downloadResult = await adapter.download('https://ev.phncdn.com/stale_240p.mp4', {
+        meta: {
+          title: 'Auto Refresh Test',
+          quality: '240p',
+          getMediaUrl: 'https://www.pornhub.org/video/get_media?s=token999'
+        }
+      });
+
+      assert.strictEqual(refreshCallMade, true, 'Must call getMediaUrl to fetch fresh signed URL');
+      assert.strictEqual(freshDownloadMade, true, 'Must download fresh signed URL');
+      assert.strictEqual(downloadResult.filename, 'Auto_Refresh_Test.mp4');
+      downloadResult.stream.destroy();
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
   // Helper function unit test
   await t.test('Helper: parseIsoDuration correctly parses ISO 8601 strings', () => {
     assert.strictEqual(parseIsoDuration('PT10M30S'), 630);

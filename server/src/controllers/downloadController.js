@@ -107,10 +107,10 @@ export async function directUrlHandler(req, res) {
 
   // Check if this format requires audio/video merging or server preparation
   const needsMerge = checkNeedsMerge(token, req.body);
-  if (token.platform === 'pornhub' || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
+  if (token.platform === 'pornhub' || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || token.meta?.isHls) {
     return res.json({
       success: false,
-      requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge),
+      requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || token.meta?.isHls),
       fallback: true,
       error: 'Direct client-side URL not available.',
     });
@@ -180,6 +180,7 @@ export async function validateDownloadHandler(req, res) {
     token.meta?.audioUrl ||
     token.platform === 'youtube' ||
     token.meta?.needsMerge ||
+    token.meta?.isHls ||
     checkNeedsMerge(token)
   );
 
@@ -639,6 +640,9 @@ async function streamDownload(downloadId, req, res) {
     res.on('close', () => {
       clearTimeout(stallTimer);
       result.stream?.destroy?.();
+      if (result._tempFilePath) {
+        fs.promises.unlink(result._tempFilePath).catch(() => {});
+      }
     });
 
     result.stream.on('end', () => {

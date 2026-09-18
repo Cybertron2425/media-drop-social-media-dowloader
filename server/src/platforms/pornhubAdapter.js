@@ -1,6 +1,17 @@
-import axios from 'axios';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { nanoid } from 'nanoid';
+import { createRequire } from 'node:module';
+import ffmpegInstaller from 'ffmpeg-static';
 import { BaseAdapter, PlatformLimitationError } from './baseAdapter.js';
-import { downloadStream } from '../utils/streamDownloader.js';
+import { downloadStream, fetchWithProxy } from '../utils/streamDownloader.js';
+
+const require = createRequire(import.meta.url);
+const ffmpeg = require('fluent-ffmpeg');
+if (ffmpegInstaller) {
+  ffmpeg.setFfmpegPath(ffmpegInstaller);
+}
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
@@ -84,6 +95,54 @@ function cleanText(value, fallback) {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+/**
+ * Downloads and packages an HLS (.m3u8) stream into a valid MP4 container using FFmpeg.
+ * Uses -c copy for fast remuxing without re-encoding, and -bsf:a aac_adtstoasc to
+ * ensure valid AAC audio in the MP4 container.
+ */
+export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    let killed = false;
+    const timeoutMs = options.timeoutMs || 300000;
+    const userAgent = options.headers?.['User-Agent'] || DEFAULT_USER_AGENT;
+    const referer = options.headers?.['Referer'] || 'https://www.pornhub.com/';
+
+    const headerString = `User-Agent: ${userAgent}\r\nReferer: ${referer}\r\n`;
+
+    const command = ffmpeg(hlsUrl)
+      .inputOptions([
+        '-headers', headerString,
+        '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+      ])
+      .outputOptions([
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-movflags', '+faststart',
+      ])
+      .output(outputPath);
+
+    const timer = setTimeout(() => {
+      killed = true;
+      try {
+        command.kill('SIGKILL');
+      } catch {}
+      reject(new Error('FFmpeg HLS download timed out.'));
+    }, timeoutMs);
+
+    command
+      .on('end', () => {
+        clearTimeout(timer);
+        resolve(outputPath);
+      })
+      .on('error', (err) => {
+        clearTimeout(timer);
+        if (killed) return;
+        reject(new Error(`FFmpeg HLS download failed: ${err.message}`));
+      })
+      .run();
+  });
+}
+
 export class PornhubAdapter extends BaseAdapter {
   static platformId = 'pornhub';
   static status = 'SUPPORTED';
@@ -129,11 +188,10 @@ export class PornhubAdapter extends BaseAdapter {
 
     let response;
     try {
-      response = await axios.get(pageUrl, {
+      response = await fetchWithProxy(pageUrl, {
         headers,
         timeout: 15000,
         validateStatus: () => true,
-        maxRedirects: 5,
       });
     } catch (err) {
       if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') {
@@ -262,16 +320,17 @@ export class PornhubAdapter extends BaseAdapter {
     }
 
     // Extract format definitions
-    let rawDefinitions = Array.isArray(flashvars?.mediaDefinitions) ? flashvars.mediaDefinitions : [];
+    const rawDefinitions = Array.isArray(flashvars?.mediaDefinitions) ? flashvars.mediaDefinitions : [];
 
-    // Check if remote get_media endpoint is provided for progressive MP4s
+    // Find remote get_media endpoint for progressive MP4s
     const remoteDef = rawDefinitions.find(
-      (d) => d.videoUrl && typeof d.videoUrl === 'string' && d.videoUrl.includes('/video/get_media')
+      (d) => d && d.videoUrl && typeof d.videoUrl === 'string' && d.videoUrl.includes('/video/get_media')
     );
 
+    let progressiveDefs = [];
     if (remoteDef) {
       try {
-        const getMediaRes = await axios.get(remoteDef.videoUrl, {
+        const getMediaRes = await fetchWithProxy(remoteDef.videoUrl, {
           headers: {
             'User-Agent': DEFAULT_USER_AGENT,
             Referer: pageUrl,
@@ -282,40 +341,83 @@ export class PornhubAdapter extends BaseAdapter {
           validateStatus: () => true,
         });
 
-        if (getMediaRes.status === 200 && Array.isArray(getMediaRes.data) && getMediaRes.data.length > 0) {
-          // Replace or augment with resolved media streams
-          rawDefinitions = getMediaRes.data;
+        if (getMediaRes.status === 200 && Array.isArray(getMediaRes.data)) {
+          progressiveDefs = getMediaRes.data.filter(
+            (d) =>
+              d &&
+              typeof d.videoUrl === 'string' &&
+              /^https?:\/\//i.test(d.videoUrl) &&
+              !d.videoUrl.includes('/video/get_media') &&
+              !d.videoUrl.includes('.m3u8')
+          );
         }
       } catch {}
     }
 
+    // Extract HLS definitions
+    const hlsDefs = rawDefinitions.filter(
+      (d) =>
+        d &&
+        typeof d.videoUrl === 'string' &&
+        /^https?:\/\//i.test(d.videoUrl) &&
+        !d.videoUrl.includes('/video/get_media') &&
+        (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+    );
+
+    // Group definitions by quality height.
+    // Prefer Progressive MP4 whenever available; fallback to HLS if only HLS is available.
+    const qualityMap = new Map();
+
+    for (const pDef of progressiveDefs) {
+      const height = Number(pDef.height || pDef.quality) || 0;
+      if (height > 0) {
+        const entry = qualityMap.get(height) || {};
+        entry.progressiveDef = pDef;
+        qualityMap.set(height, entry);
+      }
+    }
+
+    for (const hDef of hlsDefs) {
+      const height = Number(hDef.height || hDef.quality) || 0;
+      if (height > 0) {
+        const entry = qualityMap.get(height) || {};
+        entry.hlsDef = hDef;
+        qualityMap.set(height, entry);
+      }
+    }
+
+    // Fallback: if qualityMap is empty, inspect rawDefinitions (excluding get_media itself)
+    if (qualityMap.size === 0) {
+      for (const def of rawDefinitions) {
+        if (!def || typeof def.videoUrl !== 'string' || def.videoUrl.includes('/video/get_media')) continue;
+        const height = Number(def.height || def.quality) || 0;
+        if (height > 0) {
+          const isHls = def.format === 'hls' || def.videoUrl.includes('.m3u8');
+          const entry = qualityMap.get(height) || {};
+          if (isHls) entry.hlsDef = def;
+          else entry.progressiveDef = def;
+          qualityMap.set(height, entry);
+        }
+      }
+    }
+
     const formats = [];
     let formatIdx = 0;
-    const seenUrls = new Set();
 
-    for (const def of rawDefinitions) {
-      if (!def || typeof def !== 'object') continue;
-      const vUrl = def.videoUrl;
-      if (!vUrl || typeof vUrl !== 'string' || !/^https?:\/\//i.test(vUrl)) continue;
-      if (seenUrls.has(vUrl)) continue;
-      seenUrls.add(vUrl);
-
-      const height = Number(def.height || def.quality) || 0;
-      const quality = height > 0 ? `${height}p` : (def.quality ? `${def.quality}p` : 'Standard');
-      const resolution = height > 0 ? `${height}p` : null;
-      const format = (def.format || 'mp4').toLowerCase() === 'hls' ? 'mp4' : 'mp4';
-      const isM3u8 = vUrl.includes('.m3u8') || def.format === 'hls';
-
-      // Check if separate audio stream is specified
-      const audioUrl = def.audioUrl && /^https?:\/\//i.test(def.audioUrl) ? def.audioUrl : null;
+    for (const [height, { progressiveDef, hlsDef }] of qualityMap.entries()) {
+      const selectedDef = progressiveDef || hlsDef;
+      const isHls = !progressiveDef && Boolean(hlsDef);
+      const vUrl = selectedDef.videoUrl;
+      const audioUrl = selectedDef.audioUrl && /^https?:\/\//i.test(selectedDef.audioUrl) ? selectedDef.audioUrl : null;
       const needsMerge = Boolean(audioUrl);
+      const quality = `${height}p`;
 
       formats.push({
         id: `ph-${formatIdx++}`,
         quality,
-        resolution,
-        format,
-        sizeBytes: Number(def.sizeBytes) || null,
+        resolution: quality,
+        format: 'mp4',
+        sizeBytes: Number(selectedDef.sizeBytes) || null,
         mimeType: 'video/mp4',
         sourceUrl: vUrl,
         videoUrl: vUrl,
@@ -326,16 +428,18 @@ export class PornhubAdapter extends BaseAdapter {
         meta: {
           title,
           quality,
-          resolution,
-          format,
+          resolution: quality,
+          format: 'mp4',
           videoUrl: vUrl,
           audioUrl,
           needsMerge,
-          isHls: isM3u8,
+          isHls,
+          getMediaUrl: remoteDef?.videoUrl || null,
+          hlsUrl: hlsDef?.videoUrl || null,
           pageUrl,
           headers: {
             'User-Agent': DEFAULT_USER_AGENT,
-            Referer: pageUrl,
+            Referer: `https://www.${parsedHost}/`,
             Origin: `https://www.${parsedHost}`,
           },
         },
@@ -348,7 +452,7 @@ export class PornhubAdapter extends BaseAdapter {
       );
     }
 
-    // Sort highest quality / resolution first
+    // Sort highest quality / resolution first (1080p -> 720p -> 480p -> 240p)
     formats.sort((a, b) => {
       const resA = Number(a.resolution?.replace('p', '')) || 0;
       const resB = Number(b.resolution?.replace('p', '')) || 0;
@@ -367,54 +471,172 @@ export class PornhubAdapter extends BaseAdapter {
   }
 
   async download(url, options = {}) {
-    const sourceUrl = options.sourceUrl || url;
+    let sourceUrl = options.sourceUrl || url;
 
     if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl)) {
       throw new PlatformLimitationError('The Pornhub media URL is invalid.');
     }
 
-    const headers = {
+    const format = options.meta?.format || 'mp4';
+    let filename = `pornhub_video.${format}`;
+    if (options.meta?.title) {
+      const base = options.meta.title
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/_+/g, '_')
+        .slice(0, 50)
+        .replace(/^_+|_+$/g, '');
+      if (base) filename = `${base}.${format}`;
+    }
+
+    const baseHeaders = {
       'User-Agent': DEFAULT_USER_AGENT,
+      Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+      Origin: 'https://www.pornhub.com',
       Accept: '*/*',
       ...(options.meta?.headers || {}),
       ...(options.headers || {}),
     };
 
-    try {
-      const result = await downloadStream(sourceUrl, {
+    const isHls = options.meta?.isHls || sourceUrl.includes('.m3u8');
+
+    // Case 1: HLS format (when progressive MP4 is not available for this quality)
+    if (isHls) {
+      const tempFilePath = path.join(os.tmpdir(), `md_ph_hls_${nanoid(8)}.mp4`);
+      try {
+        await downloadHlsWithFfmpeg(sourceUrl, tempFilePath, {
+          headers: baseHeaders,
+        });
+
+        const stat = await fs.promises.stat(tempFilePath);
+        if (stat.size === 0) {
+          throw new Error('Downloaded HLS file is empty.');
+        }
+
+        const readStream = fs.createReadStream(tempFilePath);
+        return {
+          _tempFilePath: tempFilePath,
+          stream: readStream,
+          filename,
+          mimeType: 'video/mp4',
+          sizeBytes: stat.size,
+          statusCode: 200,
+        };
+      } catch (err) {
+        fs.promises.unlink(tempFilePath).catch(() => {});
+        if (err.message?.includes('4XX') || err.message?.includes('410') || err.message?.includes('404')) {
+          throw new PlatformLimitationError(
+            'The media stream is no longer available on Pornhub (HTTP 410).'
+          );
+        }
+        if (err.message?.includes('403') || err.message?.includes('401')) {
+          throw new PlatformLimitationError(
+            'Access to this media stream was denied by Pornhub (HTTP 403).'
+          );
+        }
+        throw new PlatformLimitationError(
+          `Failed to download HLS video stream: ${err.message}`
+        );
+      }
+    }
+
+    // Case 2: Progressive MP4
+    // Before downloading, try fetching a fresh URL from get_media if available
+    // to ensure the signed token hasn't expired or become stale
+    if (options.meta?.getMediaUrl) {
+      try {
+        const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
+          headers: {
+            'User-Agent': DEFAULT_USER_AGENT,
+            Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+            Accept: 'application/json, text/javascript, */*; q=0.01',
+          },
+          timeout: 6000,
+          validateStatus: () => true,
+        });
+
+        if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
+          const reqQuality = (options.meta?.quality || '').replace('p', '');
+          const match = freshRes.data.find(
+            (d) =>
+              d &&
+              (String(d.quality) === reqQuality || String(d.height) === reqQuality) &&
+              typeof d.videoUrl === 'string' &&
+              d.videoUrl.includes('.mp4') &&
+              !d.videoUrl.includes('.m3u8')
+          );
+          if (match?.videoUrl) {
+            sourceUrl = match.videoUrl;
+          }
+        }
+      } catch {
+        // If fresh check fails, proceed with existing sourceUrl
+      }
+    }
+
+    const executeDownload = async (targetUrl) => {
+      return await downloadStream(targetUrl, {
         ...options,
-        sourceUrl,
+        sourceUrl: targetUrl,
         meta: {
           ...(options.meta || {}),
-          headers,
+          headers: baseHeaders,
         },
       });
+    };
 
-      const format = options.meta?.format || 'mp4';
-      let filename = `pornhub_video.${format}`;
-      if (options.meta?.title) {
-        const base = options.meta.title
-          .replace(/[^a-zA-Z0-9_-]/g, '_')
-          .replace(/_+/g, '_')
-          .slice(0, 50)
-          .replace(/^_+|_+$/g, '');
-        if (base) filename = `${base}.${format}`;
-      }
-
+    try {
+      const result = await executeDownload(sourceUrl);
       return {
         ...result,
         filename,
       };
     } catch (err) {
       const status = err.response?.status;
-      if (status === 403) {
+
+      // Handle 410 (Gone/Expired) or 403 / 471 (Unauthorized) with ONE-TIME token refresh
+      if ((status === 410 || status === 403 || status === 471) && options.meta?.getMediaUrl) {
+        try {
+          const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
+            headers: {
+              'User-Agent': DEFAULT_USER_AGENT,
+              Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+              Accept: 'application/json, text/javascript, */*; q=0.01',
+            },
+            timeout: 6000,
+            validateStatus: () => true,
+          });
+
+          if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
+            const reqQuality = (options.meta?.quality || '').replace('p', '');
+            const match = freshRes.data.find(
+              (d) =>
+                d &&
+                (String(d.quality) === reqQuality || String(d.height) === reqQuality) &&
+                typeof d.videoUrl === 'string' &&
+                d.videoUrl.includes('.mp4') &&
+                !d.videoUrl.includes('.m3u8')
+            );
+            if (match?.videoUrl && match.videoUrl !== sourceUrl) {
+              const retryResult = await executeDownload(match.videoUrl);
+              return {
+                ...retryResult,
+                filename,
+              };
+            }
+          }
+        } catch {
+          // Fall through to error handler
+        }
+      }
+
+      if (status === 403 || status === 471) {
         throw new PlatformLimitationError(
           'Access to this media stream was denied by Pornhub (HTTP 403). The link may have expired.'
         );
       }
       if (status === 404 || status === 410) {
         throw new PlatformLimitationError(
-          'The media stream is no longer available on Pornhub.'
+          'The media stream is no longer available on Pornhub (HTTP 410).'
         );
       }
       if (status === 429) {

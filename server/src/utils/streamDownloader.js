@@ -53,8 +53,10 @@ export async function downloadStream(url, options = {}) {
   const customHeaders = options.meta?.headers || {};
 
   const proxies = getProxyList();
-  // Randomized order to distribute load across pool
-  const attempts = proxies.length > 0
+  // Randomized order to distribute load across pool, or use specified proxy if provided
+  const attempts = options.proxy
+    ? [options.proxy]
+    : proxies.length > 0
     ? [...proxies].sort(() => Math.random() - 0.5)
     : [null]; // direct connection if no proxy configured
 
@@ -233,6 +235,12 @@ export async function downloadStream(url, options = {}) {
       if (err.message === 'This URL cannot be processed.' || err.message === PROXY_TIMEOUT_ERROR_MESSAGE) {
         throw err;
       }
+      // HTTP 410 (Gone / Expired) and HTTP 404 (Not Found) indicate the upstream resource itself
+      // is unavailable or has an expired token. Retrying 10 other proxies will not make an expired
+      // or missing resource valid; fail fast.
+      if (err.response?.status === 410 || err.response?.status === 404) {
+        throw err;
+      }
       lastError = err;
       if (proxy) {
         if (!err.isStall) {
@@ -314,4 +322,59 @@ export async function downloadStream(url, options = {}) {
     statusCode: response.status,
     contentRange: response.headers['content-range'],
   };
+}
+
+/**
+ * Executes an HTTP request (GET or POST) through the configured proxy pool (or directly
+ * if no proxies are configured), with automatic failover across proxies.
+ * Returns { data, status, headers, proxy } on success.
+ */
+export async function fetchWithProxy(url, options = {}) {
+  const method = (options.method || 'GET').toUpperCase();
+  const timeout = options.timeout || 10000;
+  const headers = options.headers || {};
+  const data = options.data || undefined;
+  const validateStatus = options.validateStatus || ((s) => s >= 200 && s < 300);
+
+  const proxies = getProxyList();
+  const attempts = options.proxy
+    ? [options.proxy]
+    : proxies.length > 0
+    ? [...proxies].sort(() => Math.random() - 0.5)
+    : [null];
+
+  let lastError;
+  for (let i = 0; i < attempts.length; i++) {
+    const proxy = attempts[i];
+    const proxyAgent = proxy ? new HttpsProxyAgent(proxy.url) : null;
+    try {
+      const config = {
+        headers,
+        timeout,
+        proxy: false,
+        httpsAgent: proxyAgent,
+        httpAgent: proxyAgent,
+        validateStatus,
+        maxRedirects: 3,
+      };
+      const res = method === 'GET'
+        ? await axios.get(url, config)
+        : await axios({ url, method, headers, data, ...config });
+      return {
+        data: res.data,
+        status: res.status,
+        headers: res.headers,
+        proxy,
+      };
+    } catch (err) {
+      lastError = err;
+      if (err.response?.status === 410 || err.response?.status === 404) {
+        throw err;
+      }
+      if (i < attempts.length - 1) {
+        continue;
+      }
+    }
+  }
+  throw lastError;
 }
