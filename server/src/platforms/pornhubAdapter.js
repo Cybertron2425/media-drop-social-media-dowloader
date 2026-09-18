@@ -248,11 +248,127 @@ export function parseHlsPlaylist(body, baseUrl, requestedQuality = null) {
   return { isValid: false, type: 'unknown', mediaPlaylistUrl: null, variants: [] };
 }
 
+export function sanitizeHeadersForLogging(rawHeaders) {
+  if (!rawHeaders || typeof rawHeaders !== 'object') return {};
+  const safe = {};
+  for (const [k, v] of Object.entries(rawHeaders)) {
+    const lk = k.toLowerCase();
+    if (
+      lk.includes('cookie') ||
+      lk.includes('token') ||
+      lk.includes('auth') ||
+      lk.includes('secret') ||
+      lk.includes('key')
+    ) {
+      continue;
+    }
+    safe[k] = v;
+  }
+  return safe;
+}
+
+/**
+ * Performs a single diagnostic probe on the first segment URL using the exact session context.
+ * Logs diagnostic details without exposing tokens, evaluates HTTP 470 causes, and returns probe result.
+ */
+export async function probeFirstSegment(firstSegmentUrl, { headers, proxy = null, signal = null } = {}) {
+  const sanitizedUrl = sanitizeUrlForLogging(firstSegmentUrl);
+  const proxyDisplay = proxy ? (proxy.display || 'configured-proxy') : 'direct';
+
+  let diagRes;
+  try {
+    diagRes = await fetchWithProxy(firstSegmentUrl, {
+      headers,
+      proxy,
+      timeout: 15000,
+      responseType: 'arraybuffer',
+      signal,
+      validateStatus: () => true,
+    });
+  } catch (err) {
+    console.error(`[HLS Segment Probe] Request failed: ${err.message}`);
+    throw err;
+  }
+
+  const status = diagRes.status;
+  const respHeaders = diagRes.headers || {};
+  const contentType = (respHeaders['content-type'] || 'unknown').toLowerCase();
+  const rawBuf = Buffer.isBuffer(diagRes.data)
+    ? diagRes.data
+    : Buffer.from(diagRes.data || '');
+  const contentLength = respHeaders['content-length'] || rawBuf.length;
+  const safeHeaders = sanitizeHeadersForLogging(respHeaders);
+
+  const first32Hex = rawBuf.subarray(0, 32).toString('hex');
+  const isText = contentType.startsWith('text/html') || contentType.startsWith('text/plain');
+  const first200Text = isText ? rawBuf.subarray(0, 200).toString('utf8') : null;
+
+  console.log('=== [HLS First Segment Diagnostic Probe] ===');
+  console.log(`- Sanitized URL: ${sanitizedUrl}`);
+  console.log(`- Proxy used: ${proxyDisplay}`);
+  console.log(`- HTTP status: ${status}`);
+  console.log(`- Content-Type: ${contentType}`);
+  console.log(`- Content-Length: ${contentLength}`);
+  console.log(`- Response headers:`, JSON.stringify(safeHeaders));
+  console.log(`- First 32 bytes (HEX): ${first32Hex || 'none'}`);
+  if (first200Text) {
+    console.log(`- First 200 bytes (text):\n${first200Text}`);
+  }
+  console.log('============================================');
+
+  if (status === 470) {
+    let parsedSeg;
+    try {
+      parsedSeg = new URL(firstSegmentUrl);
+    } catch {
+      parsedSeg = { hostname: 'unknown', searchParams: new URLSearchParams() };
+    }
+    const host = parsedSeg.hostname;
+    const hasExpiry = parsedSeg.searchParams?.has('e') || parsedSeg.searchParams?.has('validto');
+    const hasAuthToken = parsedSeg.searchParams?.has('h') || parsedSeg.searchParams?.has('hash');
+
+    let probableCause = 'Unknown';
+    if (!proxy) {
+      probableCause = 'E. signed URL/IP mismatch (direct request without session proxy)';
+    } else if (hasExpiry) {
+      probableCause = 'E. signed URL/IP mismatch or G. expired/invalid token';
+    } else if (contentType.includes('html')) {
+      probableCause = 'C. CDN anti-bot response or A. Pornhub authorization failure';
+    } else {
+      probableCause = 'E. signed URL/IP mismatch or A. Pornhub authorization failure';
+    }
+
+    console.error('[HLS Segment Diagnostic 470 Assessment]:', {
+      hostname: host,
+      hasExpiry,
+      hasAuthToken,
+      probableCause,
+    });
+
+    throw new PlatformLimitationError('Pornhub CDN rejected the HLS segment request (HTTP 470).');
+  }
+
+  return {
+    status,
+    contentType,
+    contentLength,
+    data: rawBuf,
+    isSuccess: status === 200,
+  };
+}
+
 /**
  * Downloads an individual segment with retry & exponential backoff.
  * Streams response directly to a temporary chunk file on disk (zero memory buffering).
  */
-export async function downloadSegmentToFile(segmentUrl, chunkFilePath, headers, retries = 3, signal = null) {
+export async function downloadSegmentToFile(
+  segmentUrl,
+  chunkFilePath,
+  headers,
+  retries = 3,
+  signal = null,
+  proxy = null
+) {
   let lastErr = null;
   for (let attempt = 1; attempt <= retries; attempt++) {
     if (signal?.aborted) {
@@ -261,6 +377,7 @@ export async function downloadSegmentToFile(segmentUrl, chunkFilePath, headers, 
     try {
       const res = await fetchWithProxy(segmentUrl, {
         headers,
+        proxy,
         timeout: 15000,
         responseType: 'stream',
         signal,
@@ -285,6 +402,11 @@ export async function downloadSegmentToFile(segmentUrl, chunkFilePath, headers, 
       try {
         await fs.promises.unlink(chunkFilePath);
       } catch {}
+
+      // If Pornhub CDN rejected with HTTP 470, do NOT retry repeatedly
+      if (err.response?.status === 470) {
+        throw new PlatformLimitationError('Pornhub CDN rejected the HLS segment request (HTTP 470).');
+      }
 
       if (err.response?.status === 403 || err.response?.status === 404 || err.response?.status === 410) {
         throw err;
@@ -336,6 +458,8 @@ export async function downloadSegmentsInOrder({
   concurrency = 6,
   retries = 3,
   signal = null,
+  proxy = null,
+  preDownloadedChunk = null,
 }) {
   const combinedWriteStream = fs.createWriteStream(combinedTsPath);
 
@@ -359,7 +483,14 @@ export async function downloadSegmentsInOrder({
     return writeLock;
   };
 
-  let currentIndex = 0;
+  if (preDownloadedChunk && typeof preDownloadedChunk.index === 'number') {
+    downloadedIndices.add(preDownloadedChunk.index);
+    scheduleWrite();
+  }
+
+  let currentIndex = preDownloadedChunk && typeof preDownloadedChunk.index === 'number'
+    ? preDownloadedChunk.index + 1
+    : 0;
   const total = segmentUrls.length;
 
   const worker = async () => {
@@ -368,17 +499,19 @@ export async function downloadSegmentsInOrder({
       if (signal?.aborted) throw new Error('Download aborted by client.');
 
       const idx = currentIndex++;
+      if (idx >= total) break;
+
       const segUrl = segmentUrls[idx];
       const chunkPath = path.join(tempDir, `seg_${idx}.ts`);
 
-      await downloadSegmentToFile(segUrl, chunkPath, headers, retries, signal);
+      await downloadSegmentToFile(segUrl, chunkPath, headers, retries, signal, proxy);
 
       downloadedIndices.add(idx);
       await scheduleWrite();
     }
   };
 
-  const activeConcurrency = Math.min(concurrency, total);
+  const activeConcurrency = Math.min(concurrency, Math.max(1, total - currentIndex));
   const workerPromises = [];
   for (let w = 0; w < activeConcurrency; w++) {
     workerPromises.push(worker());
@@ -495,17 +628,24 @@ export function remuxTsToMp4WithFfmpeg(localTsPath, outputPath, options = {}) {
  * FFmpeg never accesses the network, preventing static build glibc/GnuTLS SIGSEGV crashes.
  */
 export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
-  const headers = options.headers || {
+  const headers = {
     'User-Agent': DEFAULT_USER_AGENT,
-    Referer: 'https://www.pornhub.com/',
+    Referer: options.referer || 'https://www.pornhub.com/',
+    Origin: 'https://www.pornhub.com',
+    Accept: '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Cookie: options.cookie || CONSENT_COOKIES,
+    ...(options.headers || {}),
   };
   const concurrency = options.concurrency || 6;
   const retries = options.retries || 3;
   const signal = options.signal || null;
+  const activeProxy = options.proxy || null;
 
-  // 1. Fetch playlist in Node
+  // 1. Fetch playlist in Node using session proxy if available
   const playlistRes = await fetchWithProxy(playlistUrl, {
     headers,
+    proxy: activeProxy,
     timeout: 10000,
     validateStatus: () => true,
   });
@@ -519,6 +659,9 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
     }
     throw new PlatformLimitationError('Failed to fetch a valid HLS playlist.');
   }
+
+  // Consistent session proxy for all subsequent child playlist and segment requests
+  const sessionProxy = activeProxy || playlistRes.proxy || null;
 
   let mediaPlaylistBody = playlistRes.data;
   let mediaPlaylistUrl = playlistUrl;
@@ -536,6 +679,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
 
     const childRes = await fetchWithProxy(mediaPlaylistUrl, {
       headers,
+      proxy: sessionProxy,
       timeout: 10000,
       validateStatus: () => true,
     });
@@ -569,7 +713,25 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
   const combinedTsPath = path.join(tempDir, 'combined.ts');
 
   try {
-    // 6. Download segments in parallel batches & stream to combined.ts in order
+    // 6. Diagnostic probe on the first segment URL using identical session context
+    const firstSegmentUrl = segmentUrls[0];
+    const probeRes = await probeFirstSegment(firstSegmentUrl, {
+      headers,
+      proxy: sessionProxy,
+      signal,
+    });
+
+    if (!probeRes.isSuccess || !probeRes.data || probeRes.data.length === 0) {
+      throw new PlatformLimitationError(
+        `Pornhub CDN rejected the HLS segment request (HTTP ${probeRes.status}).`
+      );
+    }
+
+    // Save pre-downloaded segment 0 to avoid re-downloading it
+    const seg0Path = path.join(tempDir, 'seg_0.ts');
+    await fs.promises.writeFile(seg0Path, probeRes.data);
+
+    // 7. Download remaining segments in parallel batches & stream to combined.ts strictly in order
     await downloadSegmentsInOrder({
       segmentUrls,
       tempDir,
@@ -578,9 +740,11 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
       concurrency,
       retries,
       signal,
+      proxy: sessionProxy,
+      preDownloadedChunk: { index: 0 },
     });
 
-    // 7. Remux combined .ts file to MP4 using FFmpeg locally (never touches network)
+    // 8. Remux combined .ts file to MP4 using FFmpeg locally (never touches network)
     await remuxTsToMp4WithFfmpeg(combinedTsPath, outPath, options);
 
     return outPath;
@@ -590,7 +754,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
     }
     throw err;
   } finally {
-    // 8. Always clean up temporary directory and part files
+    // Always clean up temporary directory and part files
     await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -805,6 +969,9 @@ export class PornhubAdapter extends BaseAdapter {
       }
     }
 
+    let getMediaItems = [];
+    const pageProxy = response.proxy || null;
+
     // Query remote get_media if available
     if (remoteDef) {
       try {
@@ -814,13 +981,16 @@ export class PornhubAdapter extends BaseAdapter {
             Referer: pageUrl,
             Origin: `https://www.${parsedHost}`,
             Accept: 'application/json, text/javascript, */*; q=0.01',
+            Cookie: CONSENT_COOKIES,
           },
+          proxy: pageProxy,
           timeout: 10000,
           validateStatus: () => true,
         });
 
         if (getMediaRes.status === 200 && Array.isArray(getMediaRes.data)) {
-          const fromMedia = getMediaRes.data.filter(
+          getMediaItems = getMediaRes.data;
+          const fromMedia = getMediaItems.filter(
             (d) =>
               d &&
               typeof d.videoUrl === 'string' &&
@@ -841,20 +1011,45 @@ export class PornhubAdapter extends BaseAdapter {
       } catch {}
     }
 
-    // Extract HLS definitions
-    const hlsDefs = rawDefinitions
-      .filter(
-        (d) =>
-          d &&
-          typeof d.videoUrl === 'string' &&
-          /^https?:\/\//i.test(d.videoUrl) &&
-          !d.videoUrl.includes('/video/get_media') &&
-          (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
-      )
-      .map((d) => ({
+    // Extract HLS definitions: prefer get_media items with validfrom=, validto=, or hash=
+    const getMediaHlsDefs = getMediaItems.filter(
+      (d) =>
+        d &&
+        typeof d.videoUrl === 'string' &&
+        /^https?:\/\//i.test(d.videoUrl) &&
+        !d.videoUrl.includes('/video/get_media') &&
+        (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+    );
+
+    const flashvarsHlsDefs = rawDefinitions.filter(
+      (d) =>
+        d &&
+        typeof d.videoUrl === 'string' &&
+        /^https?:\/\//i.test(d.videoUrl) &&
+        !d.videoUrl.includes('/video/get_media') &&
+        (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+    );
+
+    let hlsDefs = [];
+    if (getMediaHlsDefs.length > 0) {
+      // Prioritize get_media HLS URLs with validfrom= / validto= / hash=
+      getMediaHlsDefs.sort((a, b) => {
+        const aHas = a.videoUrl.includes('validfrom=') || a.videoUrl.includes('hash=');
+        const bHas = b.videoUrl.includes('validfrom=') || b.videoUrl.includes('hash=');
+        return (bHas ? 1 : 0) - (aHas ? 1 : 0);
+      });
+      hlsDefs = getMediaHlsDefs.map((d) => ({
         ...d,
         videoUrl: d.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com'),
+        fromGetMedia: true,
       }));
+    } else {
+      hlsDefs = flashvarsHlsDefs.map((d) => ({
+        ...d,
+        videoUrl: d.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com'),
+        fromGetMedia: false,
+      }));
+    }
 
     // Group definitions by quality height.
     // Prefer Progressive MP4 whenever Pornhub provides it (ev.phncdn.com, isHls: false).
@@ -933,10 +1128,12 @@ export class PornhubAdapter extends BaseAdapter {
           getMediaUrl: remoteDef?.videoUrl || null,
           hlsUrl: hlsDef?.videoUrl || null,
           pageUrl,
+          proxy: pageProxy,
           headers: {
             'User-Agent': DEFAULT_USER_AGENT,
             Referer: `https://www.${parsedHost}/`,
             Origin: `https://www.${parsedHost}`,
+            Cookie: CONSENT_COOKIES,
           },
         },
       });
@@ -984,11 +1181,15 @@ export class PornhubAdapter extends BaseAdapter {
       if (base) filename = `${base}.${format}`;
     }
 
+    const activeProxy = options.meta?.proxy || options.proxy || null;
+
     const baseHeaders = {
       'User-Agent': DEFAULT_USER_AGENT,
       Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
       Origin: 'https://www.pornhub.com',
       Accept: '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      Cookie: options.meta?.headers?.Cookie || CONSENT_COOKIES,
       ...(options.meta?.headers || {}),
       ...(options.headers || {}),
     };
@@ -1002,11 +1203,54 @@ export class PornhubAdapter extends BaseAdapter {
         hlsUrl = hlsUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
       }
 
+      // Check whether get_media provides a fresh HLS URL with validfrom=, validto=, hash=
+      if (options.meta?.getMediaUrl) {
+        try {
+          const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
+            headers: {
+              'User-Agent': DEFAULT_USER_AGENT,
+              Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+              Origin: 'https://www.pornhub.com',
+              Accept: 'application/json, text/javascript, */*; q=0.01',
+              Cookie: baseHeaders.Cookie,
+            },
+            proxy: activeProxy,
+            timeout: 6000,
+            validateStatus: () => true,
+          });
+
+          if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
+            const reqQuality = (options.meta?.quality || '').replace('p', '');
+            const hlsCandidates = freshRes.data.filter(
+              (d) =>
+                d &&
+                typeof d.videoUrl === 'string' &&
+                (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+            );
+
+            if (hlsCandidates.length > 0) {
+              hlsCandidates.sort((a, b) => {
+                const aHas = a.videoUrl.includes('validfrom=') || a.videoUrl.includes('hash=');
+                const bHas = b.videoUrl.includes('validfrom=') || b.videoUrl.includes('hash=');
+                return (bHas ? 1 : 0) - (aHas ? 1 : 0);
+              });
+              const match = hlsCandidates.find(
+                (d) => String(d.quality) === reqQuality || String(d.height) === reqQuality
+              ) || hlsCandidates[0];
+
+              if (match?.videoUrl) {
+                hlsUrl = match.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+              }
+            }
+          }
+        } catch {}
+      }
+
       let preCheckStatus = null;
       let verifiedPlaylistSnippet = null;
       let targetMediaUrl = null;
 
-      // Helper to verify a URL and resolve if master playlist (Task 3 & 4)
+      // Helper to verify a URL and resolve if master playlist
       const verifyAndResolve = async (candidateUrl) => {
         let normalized = candidateUrl;
         if (normalized.includes('hv-h.phncdn.com')) {
@@ -1015,6 +1259,7 @@ export class PornhubAdapter extends BaseAdapter {
 
         const res = await fetchWithProxy(normalized, {
           headers: baseHeaders,
+          proxy: activeProxy,
           timeout: 8000,
           validateStatus: () => true,
         });
@@ -1027,15 +1272,14 @@ export class PornhubAdapter extends BaseAdapter {
         if (!parsed.isValid) return null;
 
         if (parsed.type === 'master') {
-          // Task 4: DO NOT directly use master playlist with -c copy. Resolve variant first.
           let childUrl = parsed.mediaPlaylistUrl;
           if (childUrl.includes('hv-h.phncdn.com')) {
             childUrl = childUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
           }
 
-          // Verify child media playlist immediately (Task 8: short freshness window)
           const childRes = await fetchWithProxy(childUrl, {
             headers: baseHeaders,
+            proxy: activeProxy,
             timeout: 8000,
             validateStatus: () => true,
           });
@@ -1077,6 +1321,7 @@ export class PornhubAdapter extends BaseAdapter {
         try {
           const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
             headers: baseHeaders,
+            proxy: activeProxy,
             timeout: 10000,
             validateStatus: () => true,
           });
@@ -1123,6 +1368,7 @@ export class PornhubAdapter extends BaseAdapter {
       try {
         await downloadHlsToFile(targetMediaUrl, tempFilePath, {
           headers: baseHeaders,
+          proxy: activeProxy,
           quality: options.meta?.quality,
           preCheckStatus,
           playlistSnippet: verifiedPlaylistSnippet,

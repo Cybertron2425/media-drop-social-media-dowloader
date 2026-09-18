@@ -16,6 +16,7 @@ import {
   extractHlsSegments,
   downloadSegmentToFile,
   downloadHlsToFile,
+  probeFirstSegment,
 } from './platforms/pornhubAdapter.js';
 import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
@@ -1094,6 +1095,190 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
       try {
         await fs.promises.unlink(dummyOut);
       } catch {}
+    }
+  });
+
+  // 30. Same proxy is reused for playlist + segments
+  await t.test('30. same proxy is reused for playlist + segments', async () => {
+    const origGet = axios.get;
+    const requestedProxies = [];
+    const dummyProxy = { display: '1.2.3.4:8080', url: 'http://1.2.3.4:8080' };
+    const tmpOut = path.join(os.tmpdir(), `md_test_proxy_${nanoid(8)}.mp4`);
+    const tmpTs = path.join(os.tmpdir(), `md_test_seg_${nanoid(8)}.ts`);
+
+    const { default: ffmpeg } = await import('fluent-ffmpeg');
+    const { default: ffmpegStatic } = await import('ffmpeg-static');
+    if (ffmpegStatic) ffmpeg.setFfmpegPath(ffmpegStatic);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input('testsrc=duration=1:size=320x240:rate=10')
+        .inputFormat('lavfi')
+        .outputOptions(['-c:v libx264', '-f mpegts'])
+        .output(tmpTs)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+    const validTsBuffer = fs.readFileSync(tmpTs);
+
+    try {
+      axios.get = async (url, config) => {
+        requestedProxies.push({ url, hasAgent: Boolean(config.httpsAgent || config.httpAgent) });
+
+        if (url.includes('master.m3u8')) {
+          return {
+            status: 200,
+            data: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nmedia.m3u8',
+            headers: { 'content-type': 'application/vnd.apple.mpegurl' },
+          };
+        }
+        if (url.includes('media.m3u8')) {
+          return {
+            status: 200,
+            data: '#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nseg-1.ts?h=123&e=456\n#EXT-X-ENDLIST',
+            headers: { 'content-type': 'application/vnd.apple.mpegurl' },
+          };
+        }
+        if (url.includes('seg-1.ts')) {
+          return {
+            status: 200,
+            data: validTsBuffer,
+            headers: { 'content-type': 'video/mp2t', 'content-length': String(validTsBuffer.length) },
+          };
+        }
+        return origGet(url, config);
+      };
+
+      await downloadHlsToFile('https://cdn.example.com/master.m3u8', tmpOut, {
+        proxy: dummyProxy,
+      });
+
+      assert.ok(requestedProxies.length >= 3, 'Must have fetched master, media, and segment');
+      for (const req of requestedProxies) {
+        assert.strictEqual(req.hasAgent, true, `Request to ${req.url} must use the session proxy agent`);
+      }
+      assert.ok(fs.existsSync(tmpOut), 'Output MP4 must be created');
+    } finally {
+      axios.get = origGet;
+      try {
+        await fs.promises.unlink(tmpOut);
+        await fs.promises.unlink(tmpTs);
+      } catch {}
+    }
+  });
+
+  // 31. HTTP 470 is classified separately
+  await t.test('31. HTTP 470 is classified separately and fails immediately without retrying', async () => {
+    const origGet = axios.get;
+    let segAttempts = 0;
+
+    try {
+      axios.get = async (url, config) => {
+        if (url.includes('seg-470.ts')) {
+          segAttempts++;
+          return {
+            status: 470,
+            data: Buffer.from('Access Denied: IP signature mismatch'),
+            headers: { 'content-type': 'text/plain', 'content-length': '37' },
+          };
+        }
+        return origGet(url, config);
+      };
+
+      await assert.rejects(
+        () => probeFirstSegment('https://cdn.example.com/seg-470.ts?token=xyz', {}),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.match(err.message, /Pornhub CDN rejected the HLS segment request \(HTTP 470\)/i);
+          return true;
+        }
+      );
+
+      assert.strictEqual(segAttempts, 1, 'HTTP 470 probe must not loop or retry repeatedly');
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 32. Retry does not rotate to a different proxy within the same HLS session
+  await t.test('32. retry does not rotate to a different proxy within the same HLS session', async () => {
+    const origGet = axios.get;
+    let attempts = 0;
+    const dummyProxy = { display: '9.9.9.9:8080', url: 'http://9.9.9.9:8080' };
+    const tmpChunk = path.join(os.tmpdir(), `md_test_retry_proxy_${nanoid(8)}.ts`);
+
+    try {
+      axios.get = async (url, config) => {
+        if (url.includes('retry-proxy-segment.ts')) {
+          attempts++;
+          assert.ok(config.httpsAgent || config.httpAgent, 'Must have proxy agent attached');
+          if (attempts === 1) {
+            const err = new Error('Transient socket reset');
+            err.code = 'ECONNRESET';
+            throw err;
+          }
+          return {
+            status: 200,
+            data: Readable.from(Buffer.from('SYNC_BYTE_MPEGTS')),
+          };
+        }
+        return origGet(url, config);
+      };
+
+      await downloadSegmentToFile(
+        'https://cdn.example.com/retry-proxy-segment.ts',
+        tmpChunk,
+        {},
+        3,
+        null,
+        dummyProxy
+      );
+      assert.strictEqual(attempts, 2);
+    } finally {
+      axios.get = origGet;
+      try {
+        await fs.promises.unlink(tmpChunk);
+      } catch {}
+    }
+  });
+
+  // 33. Progressive MP4 unchanged
+  await t.test('33. progressive MP4 download flow is unchanged', async () => {
+    const origGet = axios.get;
+    let progressiveStreamCalled = false;
+
+    try {
+      axios.get = async (url, config) => {
+        if (url.includes('progressive.mp4')) {
+          progressiveStreamCalled = true;
+          return {
+            status: 200,
+            data: Readable.from(Buffer.from('MP4_VIDEO_STREAM_DATA')),
+            headers: {
+              'content-type': 'video/mp4',
+              'content-length': '21',
+            },
+          };
+        }
+        return origGet(url, config);
+      };
+
+      const result = await adapter.download('https://ev.phncdn.com/videos/progressive.mp4', {
+        meta: {
+          isHls: false,
+          format: 'mp4',
+          quality: '720p',
+          title: 'Test Video',
+        },
+      });
+
+      assert.strictEqual(progressiveStreamCalled, true);
+      assert.strictEqual(result.statusCode, 200);
+      assert.strictEqual(result.mimeType, 'video/mp4');
+      assert.strictEqual(result.filename, 'Test_Video.mp4');
+    } finally {
+      axios.get = origGet;
     }
   });
 
