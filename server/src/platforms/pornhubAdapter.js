@@ -3,14 +3,27 @@ import path from 'node:path';
 import os from 'node:os';
 import { nanoid } from 'nanoid';
 import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
 import ffmpegInstaller from 'ffmpeg-static';
 import { BaseAdapter, PlatformLimitationError } from './baseAdapter.js';
 import { downloadStream, fetchWithProxy } from '../utils/streamDownloader.js';
 
 const require = createRequire(import.meta.url);
 const ffmpeg = require('fluent-ffmpeg');
+
+// Set binary path if ffmpeg-static is installed and not already set
 if (ffmpegInstaller) {
   ffmpeg.setFfmpegPath(ffmpegInstaller);
+}
+
+// Log resolved FFmpeg executable path and version for diagnostics (Task 7)
+console.log('[FFmpeg] Resolved executable path:', ffmpegInstaller || 'system ffmpeg');
+if (ffmpegInstaller) {
+  execFile(ffmpegInstaller, ['-version'], (err, stdout) => {
+    if (!err && stdout) {
+      console.log('[FFmpeg] Version:', stdout.split('\n')[0]);
+    }
+  });
 }
 
 const DEFAULT_USER_AGENT =
@@ -97,17 +110,18 @@ function cleanText(value, fallback) {
 
 /**
  * Downloads and packages an HLS (.m3u8) stream into a valid MP4 container using FFmpeg.
- * Uses -c copy for fast remuxing without re-encoding, and -bsf:a aac_adtstoasc to
- * ensure valid AAC audio in the MP4 container.
+ * Uses fluent-ffmpeg safely, captures error, stderr, exit code, and signal.
+ * If FFmpeg exits with SIGSEGV, fails immediately without retrying and cleans up.
  */
 export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
   return new Promise((resolve, reject) => {
-    let killed = false;
+    let finished = false;
     const timeoutMs = options.timeoutMs || 300000;
     const userAgent = options.headers?.['User-Agent'] || DEFAULT_USER_AGENT;
     const referer = options.headers?.['Referer'] || 'https://www.pornhub.com/';
 
     const headerString = `User-Agent: ${userAgent}\r\nReferer: ${referer}\r\n`;
+    const stderrLines = [];
 
     const command = ffmpeg(hlsUrl)
       .inputOptions([
@@ -116,28 +130,59 @@ export function downloadHlsWithFfmpeg(hlsUrl, outputPath, options = {}) {
       ])
       .outputOptions([
         '-c', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
         '-movflags', '+faststart',
       ])
       .output(outputPath);
 
-    const timer = setTimeout(() => {
-      killed = true;
+    command.on('stderr', (line) => {
+      stderrLines.push(line);
+      if (stderrLines.length > 25) stderrLines.shift();
+    });
+
+    const killProcess = () => {
+      if (finished) return;
       try {
         command.kill('SIGKILL');
       } catch {}
+    };
+
+    const timer = setTimeout(() => {
+      finished = true;
+      killProcess();
       reject(new Error('FFmpeg HLS download timed out.'));
     }, timeoutMs);
 
     command
       .on('end', () => {
+        finished = true;
         clearTimeout(timer);
         resolve(outputPath);
       })
-      .on('error', (err) => {
+      .on('error', (err, stdout, stderr) => {
+        finished = true;
         clearTimeout(timer);
-        if (killed) return;
-        reject(new Error(`FFmpeg HLS download failed: ${err.message}`));
+        killProcess();
+
+        const isSigsegv =
+          err.message?.includes('SIGSEGV') ||
+          err.signal === 'SIGSEGV' ||
+          err.code === 'SIGSEGV' ||
+          err.code === 139;
+
+        if (isSigsegv) {
+          console.error('[FFmpeg SIGSEGV Error]: FFmpeg segmentation fault during HLS processing.');
+          const sigsegvErr = new PlatformLimitationError(
+            'HLS processing failed on the server. Please try another quality.'
+          );
+          sigsegvErr.isSigsegv = true;
+          return reject(sigsegvErr);
+        }
+
+        const lastErr = stderrLines.slice(-3).join(' ') || stderr || err.message;
+        const ffmpegErr = new Error(`FFmpeg HLS download failed: ${err.message} (${lastErr})`);
+        ffmpegErr.originalError = err;
+        ffmpegErr.stderr = stderr || lastErr;
+        reject(ffmpegErr);
       })
       .run();
   });
@@ -328,6 +373,25 @@ export class PornhubAdapter extends BaseAdapter {
     );
 
     let progressiveDefs = [];
+
+    // Check if progressive MP4s are already present in flashvars
+    for (const def of rawDefinitions) {
+      if (
+        def &&
+        def.format === 'mp4' &&
+        typeof def.videoUrl === 'string' &&
+        /^https?:\/\//i.test(def.videoUrl) &&
+        !def.videoUrl.includes('/video/get_media') &&
+        !def.videoUrl.includes('.m3u8')
+      ) {
+        const height = Number(def.height || def.quality) || 0;
+        if (height > 0 && !progressiveDefs.some((p) => (Number(p.height || p.quality) || 0) === height)) {
+          progressiveDefs.push(def);
+        }
+      }
+    }
+
+    // Query remote get_media if available
     if (remoteDef) {
       try {
         const getMediaRes = await fetchWithProxy(remoteDef.videoUrl, {
@@ -342,7 +406,7 @@ export class PornhubAdapter extends BaseAdapter {
         });
 
         if (getMediaRes.status === 200 && Array.isArray(getMediaRes.data)) {
-          progressiveDefs = getMediaRes.data.filter(
+          const fromMedia = getMediaRes.data.filter(
             (d) =>
               d &&
               typeof d.videoUrl === 'string' &&
@@ -350,6 +414,15 @@ export class PornhubAdapter extends BaseAdapter {
               !d.videoUrl.includes('/video/get_media') &&
               !d.videoUrl.includes('.m3u8')
           );
+          for (const item of fromMedia) {
+            const h = Number(item.height || item.quality) || 0;
+            const existingIdx = progressiveDefs.findIndex((p) => (Number(p.height || p.quality) || 0) === h);
+            if (existingIdx >= 0) {
+              progressiveDefs[existingIdx] = item;
+            } else {
+              progressiveDefs.push(item);
+            }
+          }
         }
       } catch {}
     }
@@ -365,7 +438,8 @@ export class PornhubAdapter extends BaseAdapter {
     );
 
     // Group definitions by quality height.
-    // Prefer Progressive MP4 whenever available; fallback to HLS if only HLS is available.
+    // Task 8: Prefer Progressive MP4 whenever Pornhub provides it (ev.phncdn.com, isHls: false).
+    // HLS should only be used when no progressive MP4 exists.
     const qualityMap = new Map();
 
     for (const pDef of progressiveDefs) {
@@ -497,13 +571,91 @@ export class PornhubAdapter extends BaseAdapter {
       ...(options.headers || {}),
     };
 
-    const isHls = options.meta?.isHls || sourceUrl.includes('.m3u8');
+    const isHls = Boolean(options.meta?.isHls || sourceUrl.includes('.m3u8'));
 
-    // Case 1: HLS format (when progressive MP4 is not available for this quality)
+    // Case 1: HLS format (only when progressive MP4 is not available)
     if (isHls) {
+      let hlsUrl = sourceUrl;
+
+      // Task 4: Before using FFmpeg:
+      // - Verify the HLS URL is actually a .m3u8 playlist.
+      // - Fetch/check the playlist through the existing proxy mechanism.
+      // - If the playlist returns 403/404/410, refresh the Pornhub media URL once.
+      // - Never pass an expired or invalid URL to FFmpeg.
+      let playlistVerified = false;
+      try {
+        const checkRes = await fetchWithProxy(hlsUrl, {
+          headers: baseHeaders,
+          timeout: 8000,
+          validateStatus: () => true,
+        });
+
+        if (
+          checkRes.status === 200 &&
+          typeof checkRes.data === 'string' &&
+          checkRes.data.includes('#EXTM3U')
+        ) {
+          playlistVerified = true;
+        }
+      } catch {}
+
+      // If playlist is expired, 403/404/410, or invalid, refresh via pageUrl once
+      if (!playlistVerified && options.meta?.pageUrl) {
+        try {
+          const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
+            headers: baseHeaders,
+            timeout: 10000,
+            validateStatus: () => true,
+          });
+
+          if (freshPageRes.status === 200 && typeof freshPageRes.data === 'string') {
+            const freshHtml = freshPageRes.data;
+            const flashMatch = freshHtml.match(/var\s+flashvars_\d+\s*=\s*({.+?});/s);
+            if (flashMatch) {
+              const freshFlashvars = JSON.parse(flashMatch[1]);
+              const freshDefs = Array.isArray(freshFlashvars?.mediaDefinitions)
+                ? freshFlashvars.mediaDefinitions
+                : [];
+              const reqQuality = (options.meta?.quality || '').replace('p', '');
+
+              const freshHlsMatch = freshDefs.find(
+                (d) =>
+                  d &&
+                  (String(d.quality) === reqQuality || String(d.height) === reqQuality) &&
+                  typeof d.videoUrl === 'string' &&
+                  (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+              );
+
+              if (freshHlsMatch?.videoUrl) {
+                hlsUrl = freshHlsMatch.videoUrl;
+                const freshCheck = await fetchWithProxy(hlsUrl, {
+                  headers: baseHeaders,
+                  timeout: 8000,
+                  validateStatus: () => true,
+                });
+                if (
+                  freshCheck.status === 200 &&
+                  typeof freshCheck.data === 'string' &&
+                  freshCheck.data.includes('#EXTM3U')
+                ) {
+                  playlistVerified = true;
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+
+      if (!playlistVerified) {
+        throw new PlatformLimitationError(
+          'The media stream is no longer available on Pornhub (HTTP 410).'
+        );
+      }
+
+      // Safe to run FFmpeg with verified fresh HLS playlist
       const tempFilePath = path.join(os.tmpdir(), `md_ph_hls_${nanoid(8)}.mp4`);
       try {
-        await downloadHlsWithFfmpeg(sourceUrl, tempFilePath, {
+        await downloadHlsWithFfmpeg(hlsUrl, tempFilePath, {
           headers: baseHeaders,
         });
 
@@ -523,7 +675,14 @@ export class PornhubAdapter extends BaseAdapter {
         };
       } catch (err) {
         fs.promises.unlink(tempFilePath).catch(() => {});
-        if (err.message?.includes('4XX') || err.message?.includes('410') || err.message?.includes('404')) {
+        if (err.isSigsegv) {
+          throw err;
+        }
+        if (
+          err.message?.includes('4XX') ||
+          err.message?.includes('410') ||
+          err.message?.includes('404')
+        ) {
           throw new PlatformLimitationError(
             'The media stream is no longer available on Pornhub (HTTP 410).'
           );
