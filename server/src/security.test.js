@@ -58,27 +58,27 @@ test('Security Hardening & Platform Removal Verification', async (t) => {
     });
   });
 
-  await t.test('1. Pornhub is unhandled and YouTube is registered', async () => {
-    assert.strictEqual(getAdapter('pornhub'), undefined, 'PornhubAdapter must not exist in registry');
+  await t.test('1. Pornhub and YouTube are properly registered in registry', async () => {
+    assert.ok(getAdapter('pornhub'), 'PornhubAdapter must be registered in registry');
     assert.ok(getAdapter('youtube'), 'YouTubeAdapter must be registered');
 
     const phAdapter = resolveAdapter('https://www.pornhub.com/view_video.php?viewkey=64f7b6058a23a');
-    assert.strictEqual(phAdapter, undefined, 'resolveAdapter must return undefined for Pornhub URL');
+    assert.ok(phAdapter, 'resolveAdapter must return PornhubAdapter for Pornhub URL');
+    assert.strictEqual(phAdapter.constructor.platformId, 'pornhub');
 
     const ytAdapter = resolveAdapter('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
     assert.ok(ytAdapter, 'resolveAdapter must return YouTubeAdapter for YouTube URL');
 
-    // /api/analyze returns 400 for Pornhub
-    const phRes = await makeRequest(
+    // /api/analyze returns 400 for unsupported/blocked platform
+    const unhandledRes = await makeRequest(
       server,
       { method: 'POST', path: '/api/analyze', headers: { 'Content-Type': 'application/json' } },
-      { url: 'https://www.pornhub.com/view_video.php?viewkey=64f7b6058a23a' }
+      { url: 'https://www.xhamster.com/video/12345' }
     );
-    assert.strictEqual(phRes.statusCode, 400);
-    const phJson = phRes.json();
-    assert.strictEqual(phJson.success, false);
-    assert.strictEqual(phJson.error, 'This platform is currently not supported.');
-
+    assert.strictEqual(unhandledRes.statusCode, 400);
+    const unhandledJson = unhandledRes.json();
+    assert.strictEqual(unhandledJson.success, false);
+    assert.strictEqual(unhandledJson.error, 'This platform is currently not supported.');
   });
 
   await t.test('2. SSRF protection strictly blocks all private/internal and metadata IP ranges', async () => {

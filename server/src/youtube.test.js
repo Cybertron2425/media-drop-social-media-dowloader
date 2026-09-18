@@ -585,6 +585,259 @@ test('getProxyList parses PROXY_LIST, PROXY_HOST/PORT, and handles empty env', a
   }
 });
 
+test('downloadStream uses 8s timeout per proxy attempt', async () => {
+  const { downloadStream } = await import('./utils/streamDownloader.js');
+  const oldList = process.env.PROXY_LIST;
+  process.env.PROXY_LIST = '1.1.1.1:8080,2.2.2.2:8080';
+
+  const capturedTimeouts = [];
+  const originalGet = axios.get;
+  axios.get = async (url, config) => {
+    capturedTimeouts.push(config.timeout);
+    const err = new Error('connect ECONNREFUSED');
+    err.code = 'ECONNREFUSED';
+    throw err;
+  };
+
+  try {
+    await assert.rejects(
+      () => downloadStream('https://example.com/video.mp4'),
+      (err) => err.message === 'This video cannot be downloaded from this source.'
+    );
+    assert.equal(capturedTimeouts.length, 2);
+    assert.equal(capturedTimeouts[0], 8000);
+    assert.equal(capturedTimeouts[1], 8000);
+  } finally {
+    axios.get = originalGet;
+    if (oldList !== undefined) process.env.PROXY_LIST = oldList; else delete process.env.PROXY_LIST;
+  }
+});
+
+test('downloadStream aborts with friendly error when overall 90s proxy budget expires', async () => {
+  const { downloadStream } = await import('./utils/streamDownloader.js');
+  const oldList = process.env.PROXY_LIST;
+  process.env.PROXY_LIST = '1.1.1.1:8080,2.2.2.2:8080,3.3.3.3:8080';
+
+  const originalDateNow = Date.now;
+  let simulatedTime = 1000000;
+  Date.now = () => simulatedTime;
+
+  const originalGet = axios.get;
+  axios.get = async (url, config) => {
+    // Advance simulated time past 90 seconds after first attempt
+    simulatedTime += 91000;
+    const err = new Error('ETIMEDOUT');
+    err.code = 'ETIMEDOUT';
+    throw err;
+  };
+
+  try {
+    await assert.rejects(
+      () => downloadStream('https://example.com/video.mp4'),
+      (err) => err.message === 'This video is taking too long to download via our free servers right now. Please try a lower quality, or try again in a few minutes.'
+    );
+  } finally {
+    Date.now = originalDateNow;
+    axios.get = originalGet;
+    if (oldList !== undefined) process.env.PROXY_LIST = oldList; else delete process.env.PROXY_LIST;
+  }
+});
+
+test('analyzeHandler exposes needsMerge: true/false on each format object', async () => {
+  const { analyzeHandler } = await import('./controllers/analyzeController.js');
+  const { YouTubeAdapter } = await import('./platforms/youtubeAdapter.js');
+
+  const originalAnalyze = YouTubeAdapter.prototype.analyze;
+  YouTubeAdapter.prototype.analyze = async () => ({
+    title: 'Mock Video',
+    formats: [
+      {
+        id: 'fmt-1080p',
+        quality: '1080p',
+        resolution: '1080p',
+        format: 'mp4',
+        sizeBytes: 1000000,
+        hasAudio: false,
+        sourceUrl: 'https://example.com/1080p.mp4',
+        needsMerge: true,
+        meta: { needsMerge: true, audioUrl: 'https://example.com/audio.m4a' },
+      },
+      {
+        id: 'fmt-720p',
+        quality: '720p',
+        resolution: '720p',
+        format: 'mp4',
+        sizeBytes: 500000,
+        hasAudio: true,
+        sourceUrl: 'https://example.com/720p.mp4',
+        needsMerge: false,
+        meta: { needsMerge: false },
+      },
+    ],
+  });
+
+  const req = {
+    body: { url: 'https://www.youtube.com/watch?v=mock1234567' },
+    id: 'test-req',
+  };
+  let responseData = null;
+  const res = {
+    json: (data) => { responseData = data; return res; },
+    status: () => res,
+  };
+
+  try {
+    await analyzeHandler(req, res);
+
+    assert.ok(responseData);
+    assert.equal(responseData.success, true);
+    assert.equal(responseData.formats.length, 2);
+    assert.equal(responseData.formats[0].needsMerge, true);
+    assert.equal(responseData.formats[1].needsMerge, false);
+  } finally {
+    YouTubeAdapter.prototype.analyze = originalAnalyze;
+  }
+});
+
+test('downloadStream switches to next proxy when data stream stalls for PROXY_STALL_TIMEOUT_MS', async () => {
+  const { downloadStream } = await import('./utils/streamDownloader.js');
+  const { Readable } = await import('node:stream');
+
+  const oldList = process.env.PROXY_LIST;
+  const oldStall = process.env.PROXY_STALL_TIMEOUT_MS;
+  process.env.PROXY_LIST = '1.1.1.1:8080,2.2.2.2:8080';
+  process.env.PROXY_STALL_TIMEOUT_MS = '60';
+
+  let callIndex = 0;
+  let stalledStreamDestroyed = false;
+  const originalGet = axios.get;
+
+  axios.get = async (url, config) => {
+    callIndex++;
+    if (callIndex === 1) {
+      // First proxy connects, but its stream stalls without sending data
+      const stallingStream = new Readable({
+        read() {}, // never pushes data
+      });
+      stallingStream.destroy = (err) => {
+        stalledStreamDestroyed = true;
+        Readable.prototype.destroy.call(stallingStream, err);
+      };
+      return {
+        status: 200,
+        headers: { 'content-type': 'video/mp4' },
+        data: stallingStream,
+      };
+    }
+
+    // Second proxy succeeds and sends data
+    const workingStream = new Readable({
+      read() {
+        this.push(Buffer.from('working video data'));
+        this.push(null);
+      },
+    });
+    return {
+      status: 200,
+      headers: { 'content-type': 'video/mp4' },
+      data: workingStream,
+    };
+  };
+
+  try {
+    const result = await downloadStream('https://example.com/video.mp4');
+    assert.ok(result);
+    assert.ok(result.stream);
+    assert.equal(callIndex, 2, 'Should have failed over to second proxy');
+    assert.equal(stalledStreamDestroyed, true, 'Stalled stream should be destroyed');
+  } finally {
+    axios.get = originalGet;
+    if (oldList !== undefined) process.env.PROXY_LIST = oldList; else delete process.env.PROXY_LIST;
+    if (oldStall !== undefined) process.env.PROXY_STALL_TIMEOUT_MS = oldStall; else delete process.env.PROXY_STALL_TIMEOUT_MS;
+  }
+});
+
+test('downloadStream resets stall timer on incoming data chunks and succeeds', async () => {
+  const { downloadStream } = await import('./utils/streamDownloader.js');
+  const { Readable } = await import('node:stream');
+
+  const oldList = process.env.PROXY_LIST;
+  const oldStall = process.env.PROXY_STALL_TIMEOUT_MS;
+  process.env.PROXY_LIST = '1.1.1.1:8080';
+  process.env.PROXY_STALL_TIMEOUT_MS = '80'; // 80ms stall window
+
+  const originalGet = axios.get;
+  axios.get = async (url, config) => {
+    const stream = new Readable({ read() {} });
+    // Emit 3 chunks with 40ms interval (total 120ms > 80ms, but interval < 80ms)
+    setTimeout(() => stream.push(Buffer.from('chunk1 ')), 30);
+    setTimeout(() => stream.push(Buffer.from('chunk2 ')), 70);
+    setTimeout(() => {
+      stream.push(Buffer.from('chunk3'));
+      stream.push(null);
+    }, 110);
+
+    return {
+      status: 200,
+      headers: { 'content-type': 'video/mp4' },
+      data: stream,
+    };
+  };
+
+  try {
+    const result = await downloadStream('https://example.com/video.mp4');
+    assert.ok(result);
+    assert.ok(result.stream);
+  } finally {
+    axios.get = originalGet;
+    if (oldList !== undefined) process.env.PROXY_LIST = oldList; else delete process.env.PROXY_LIST;
+    if (oldStall !== undefined) process.env.PROXY_STALL_TIMEOUT_MS = oldStall; else delete process.env.PROXY_STALL_TIMEOUT_MS;
+  }
+});
+
+test('downloadStream safely handles extensionless URLs like googlevideo.com/videoplayback without ENOENT', async () => {
+  const { downloadStream } = await import('./utils/streamDownloader.js');
+  const { Readable } = await import('node:stream');
+  const path = await import('node:path');
+
+  const oldList = process.env.PROXY_LIST;
+  process.env.PROXY_LIST = '1.1.1.1:8080';
+
+  const originalGet = axios.get;
+  axios.get = async (url, config) => {
+    const stream = new Readable({
+      read() {
+        this.push(Buffer.from('videoplayback raw bytes'));
+        this.push(null);
+      },
+    });
+    return {
+      status: 200,
+      headers: { 'content-type': 'video/mp4', 'content-length': '23' },
+      data: stream,
+    };
+  };
+
+  try {
+    const videoPlaybackUrl = 'https://rr1---sn-4pgnuapbiu-5acd.googlevideo.com/videoplayback?expire=123&id=456';
+    const result = await downloadStream(videoPlaybackUrl);
+    assert.ok(result);
+    assert.ok(result.stream);
+    assert.equal(result.filename, 'videoplayback');
+
+    const tempPath = String(result.stream.path);
+    assert.ok(tempPath, 'result.stream should have a valid path');
+    const base = path.basename(tempPath);
+    assert.ok(!tempPath.includes('videoplayback'), `Temp path "${tempPath}" must not contain "videoplayback"`);
+    assert.ok(!tempPath.includes('/videoplayback'), `Temp path "${tempPath}" must not contain "/videoplayback"`);
+    assert.ok(!tempPath.includes('\\videoplayback'), `Temp path "${tempPath}" must not contain "\\videoplayback"`);
+    assert.match(base, /^md_proxy_[a-zA-Z0-9_-]+\.tmp$/, `Temp filename "${base}" must match safe md_proxy_<random>.tmp format`);
+  } finally {
+    axios.get = originalGet;
+    if (oldList !== undefined) process.env.PROXY_LIST = oldList; else delete process.env.PROXY_LIST;
+  }
+});
+
 
 
 

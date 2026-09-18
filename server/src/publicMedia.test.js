@@ -368,45 +368,55 @@ test('Third-Party Public Media Adapter', async (t) => {
   });
 
   await t.test('Retries download without Referer when CDN returns 403 to cross-origin Referer', async () => {
+    const oldProxyList = process.env.PROXY_LIST;
+    const oldProxyHost = process.env.PROXY_HOST;
+    delete process.env.PROXY_LIST;
+    delete process.env.PROXY_HOST;
+
     let callCount = 0;
     const calls = [];
 
-    axios.get = async (url, config = {}) => {
-      callCount++;
-      calls.push({ url, headers: config.headers });
-      if (callCount === 1) {
-        // First attempt with Referer receives 403 from CDN
-        const err = new Error('Request failed with status code 403');
-        err.response = { status: 403, headers: { 'content-type': 'text/plain' } };
-        throw err;
-      }
-      // Second attempt without Referer succeeds
-      const stream = new Readable();
-      stream.push(Buffer.from('stream without referer'));
-      stream.push(null);
-      return {
-        data: stream,
-        headers: {
-          'content-type': 'video/mp4',
-          'content-length': '22',
-        },
+    try {
+      axios.get = async (url, config = {}) => {
+        callCount++;
+        calls.push({ url, headers: config.headers });
+        if (callCount === 1) {
+          // First attempt with Referer receives 403 from CDN
+          const err = new Error('Request failed with status code 403');
+          err.response = { status: 403, headers: { 'content-type': 'text/plain' } };
+          throw err;
+        }
+        // Second attempt without Referer succeeds
+        const stream = new Readable();
+        stream.push(Buffer.from('stream without referer'));
+        stream.push(null);
+        return {
+          data: stream,
+          headers: {
+            'content-type': 'video/mp4',
+            'content-length': '22',
+          },
+        };
       };
-    };
 
-    const publicAdapter = getAdapter('public-media');
-    const result = await publicAdapter.download('https://example.com/video.mp4', {
-      sourceUrl: 'https://example.com/video.mp4',
-      meta: {
-        pageUrl: 'https://example.com/page',
-        headers: { Referer: 'https://example.com/page' },
-      },
-    });
+      const publicAdapter = getAdapter('public-media');
+      const result = await publicAdapter.download('https://example.com/video.mp4', {
+        sourceUrl: 'https://example.com/video.mp4',
+        meta: {
+          pageUrl: 'https://example.com/page',
+          headers: { Referer: 'https://example.com/page' },
+        },
+      });
 
-    assert.ok(result.stream);
-    assert.equal(callCount, 2);
-    assert.equal(calls[0].headers.Referer, 'https://example.com/page');
-    assert.equal(calls[1].headers.Referer, undefined);
-    assert.equal(result.mimeType, 'video/mp4');
+      assert.ok(result.stream);
+      assert.equal(callCount, 2);
+      assert.equal(calls[0].headers.Referer, 'https://example.com/page');
+      assert.equal(calls[1].headers.Referer, undefined);
+      assert.equal(result.mimeType, 'video/mp4');
+    } finally {
+      if (oldProxyList !== undefined) process.env.PROXY_LIST = oldProxyList;
+      if (oldProxyHost !== undefined) process.env.PROXY_HOST = oldProxyHost;
+    }
   });
 
   await t.test('Instagram and Facebook adapters remain active and registered', () => {

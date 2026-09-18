@@ -107,12 +107,12 @@ export async function directUrlHandler(req, res) {
 
   // Check if this format requires audio/video merging or server preparation
   const needsMerge = checkNeedsMerge(token, req.body);
-  if (needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
+  if (token.platform === 'pornhub' || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
     return res.json({
       success: false,
-      requiresPrepare: true,
+      requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge),
       fallback: true,
-      error: 'Preparation and merging required for this format.',
+      error: 'Direct client-side URL not available.',
     });
   }
 
@@ -601,6 +601,7 @@ async function streamDownload(downloadId, req, res) {
       formatId: token.formatId,
       sourceUrl: token.sourceUrl,
       meta: token.meta,
+      headers: req.headers.range ? { Range: req.headers.range } : {},
     });
 
     if (result.sizeBytes && result.sizeBytes > MAX_FILE_SIZE_BYTES) {
@@ -611,8 +612,16 @@ async function streamDownload(downloadId, req, res) {
 
     res.setHeader('Content-Type', result.mimeType || 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(result.filename)}"`);
-    if (result.sizeBytes) res.setHeader('Content-Length', result.sizeBytes);
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    if (result.statusCode === 206) {
+      res.status(206);
+      if (result.contentRange) res.setHeader('Content-Range', result.contentRange);
+      if (result.sizeBytes) res.setHeader('Content-Length', result.sizeBytes);
+    } else if (result.sizeBytes) {
+      res.setHeader('Content-Length', result.sizeBytes);
+    }
 
     let bytesStreamed = 0;
     result.stream.on('data', (chunk) => {
@@ -626,6 +635,11 @@ async function streamDownload(downloadId, req, res) {
     });
 
     result.stream.pipe(res);
+
+    res.on('close', () => {
+      clearTimeout(stallTimer);
+      result.stream?.destroy?.();
+    });
 
     result.stream.on('end', () => {
       // Clean up adapter temp file if one was produced.

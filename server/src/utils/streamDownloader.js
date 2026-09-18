@@ -1,3 +1,7 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { nanoid } from 'nanoid';
 import axios from 'axios';
 import net from 'node:net';
 import mime from 'mime-types';
@@ -56,12 +60,35 @@ export async function downloadStream(url, options = {}) {
 
   let response;
   let lastError;
+  let spooledTempPath = null;
+  const loopStartTime = Date.now();
+  const PROXY_ATTEMPT_TIMEOUT_MS = 8000;
+  const DIRECT_TIMEOUT_MS = 120000;
+  const PROXY_TOTAL_BUDGET_MS = 90000;
+  const PROXY_TIMEOUT_ERROR_MESSAGE =
+    'This video is taking too long to download via our free servers right now. Please try a lower quality, or try again in a few minutes.';
 
   for (let i = 0; i < attempts.length; i++) {
     const proxy = attempts[i];
+
+    // Check overall time budget across proxy attempts before initiating next attempt
+    if (proxy) {
+      const elapsedMs = Date.now() - loopStartTime;
+      if (elapsedMs >= PROXY_TOTAL_BUDGET_MS) {
+        console.warn(
+          `[Proxy] Total wall-clock budget of ${PROXY_TOTAL_BUDGET_MS / 1000}s exceeded before attempt ${i + 1}/${attempts.length}`
+        );
+        throw new Error(PROXY_TIMEOUT_ERROR_MESSAGE);
+      }
+    }
+
     const proxyAgent = proxy ? new HttpsProxyAgent(proxy.url) : null;
-    // Short 20s timeout per proxy attempt so dead proxies fail fast; 120s for direct
-    const timeout = proxy ? 20000 : 120000;
+    // Short 8s timeout per proxy attempt so dead/slow proxies fail fast; remaining budget if < 8s; 120s for direct
+    let timeout = DIRECT_TIMEOUT_MS;
+    if (proxy) {
+      const remainingBudgetMs = Math.max(1000, PROXY_TOTAL_BUDGET_MS - (Date.now() - loopStartTime));
+      timeout = Math.min(PROXY_ATTEMPT_TIMEOUT_MS, remainingBudgetMs);
+    }
 
     try {
       response = await axios.get(targetUrl, {
@@ -116,17 +143,110 @@ export async function downloadStream(url, options = {}) {
 
       if (proxy) {
         console.log(`[Proxy] Successfully connected via ${proxy.display} for ${targetUrl.slice(0, 60)}`);
+
+        // Monitor stream transfer for stalls. If no new chunk arrives within
+        // PROXY_STALL_TIMEOUT_MS (default 10s), abort and fail over to the next proxy.
+        const stallTimeoutMs = parseInt(process.env.PROXY_STALL_TIMEOUT_MS, 10) || 10000;
+        const tempFilePath = path.join(os.tmpdir(), `md_proxy_${nanoid(16)}.tmp`);
+        const fileWriteStream = fs.createWriteStream(tempFilePath);
+
+        try {
+          await new Promise((resolveStream, rejectStream) => {
+            let stallTimer = null;
+            let streamFinished = false;
+
+            const cleanup = () => {
+              if (stallTimer) {
+                clearTimeout(stallTimer);
+                stallTimer = null;
+              }
+              try {
+                response.data?.unpipe?.(fileWriteStream);
+                response.data?.destroy?.();
+                fileWriteStream.destroy?.();
+              } catch {}
+            };
+
+            const resetStallTimer = () => {
+              if (stallTimer) clearTimeout(stallTimer);
+              if (streamFinished) return;
+
+              const elapsedMs = Date.now() - loopStartTime;
+              if (elapsedMs >= PROXY_TOTAL_BUDGET_MS) {
+                cleanup();
+                rejectStream(new Error(PROXY_TIMEOUT_ERROR_MESSAGE));
+                return;
+              }
+
+              const remainingBudget = PROXY_TOTAL_BUDGET_MS - elapsedMs;
+              const effectiveTimeout = Math.min(stallTimeoutMs, remainingBudget);
+
+              stallTimer = setTimeout(() => {
+                if (streamFinished) return;
+                cleanup();
+                const stallSec = Math.round(stallTimeoutMs / 1000);
+                console.warn(
+                  `[Proxy] Stalled (no data for ${stallSec}s) via ${proxy.display}, switching to next proxy`
+                );
+                const stallErr = new Error(`Proxy stalled (no data for ${stallSec}s)`);
+                stallErr.isStall = true;
+                rejectStream(stallErr);
+              }, effectiveTimeout);
+            };
+
+            // 1. Start stall monitoring immediately on response stream
+            resetStallTimer();
+
+            // 2. Reset stall timer on every incoming data chunk
+            response.data.on('data', () => {
+              resetStallTimer();
+            });
+
+            response.data.on('error', (err) => {
+              cleanup();
+              rejectStream(err);
+            });
+
+            fileWriteStream.on('error', (err) => {
+              cleanup();
+              rejectStream(err);
+            });
+
+            fileWriteStream.on('finish', () => {
+              streamFinished = true;
+              if (stallTimer) clearTimeout(stallTimer);
+              resolveStream();
+            });
+
+            response.data.pipe(fileWriteStream);
+          });
+
+          spooledTempPath = tempFilePath;
+        } catch (streamErr) {
+          fs.promises.unlink(tempFilePath).catch(() => {});
+          throw streamErr;
+        }
       }
+
       break;
     } catch (err) {
-      if (err.message === 'This URL cannot be processed.') {
+      if (err.message === 'This URL cannot be processed.' || err.message === PROXY_TIMEOUT_ERROR_MESSAGE) {
         throw err;
       }
       lastError = err;
       if (proxy) {
-        console.warn(
-          `[Proxy] Attempt ${i + 1}/${attempts.length} failed via ${proxy.display}: ${err.message} (status: ${err.response?.status || err.code})`
-        );
+        if (!err.isStall) {
+          console.warn(
+            `[Proxy] Attempt ${i + 1}/${attempts.length} failed via ${proxy.display}: ${err.message} (status: ${err.response?.status || err.code})`
+          );
+        }
+        // If overall time budget has expired after this attempt (or stall), fail immediately
+        if (Date.now() - loopStartTime >= PROXY_TOTAL_BUDGET_MS) {
+          console.warn(
+            `[Proxy] Total wall-clock budget of ${PROXY_TOTAL_BUDGET_MS / 1000}s exceeded after attempt ${i + 1}`
+          );
+          throw new Error(PROXY_TIMEOUT_ERROR_MESSAGE);
+        }
         if (i < attempts.length - 1) {
           continue;
         }
@@ -135,7 +255,10 @@ export async function downloadStream(url, options = {}) {
     }
   }
 
-  if (!response) {
+  if (!response || (proxies.length > 0 && !spooledTempPath)) {
+    if (proxies.length > 0 && Date.now() - loopStartTime >= PROXY_TOTAL_BUDGET_MS) {
+      throw new Error(PROXY_TIMEOUT_ERROR_MESSAGE);
+    }
     const err = lastError;
     console.error(
       `[DownloadStream Error] target=${targetUrl.slice(0, 80)} status=${err?.response?.status} contentType=${err?.response?.headers?.['content-type']} code=${err?.code} err=${err?.message}`
@@ -152,8 +275,11 @@ export async function downloadStream(url, options = {}) {
     throw err || new Error('This video cannot be downloaded from this source.');
   }
 
-  const ext = parsed.pathname.split('.').pop()?.toLowerCase() || 'bin';
-  const filename = decodeURIComponent(parsed.pathname.split('/').pop() || `download.${ext}`);
+  const pathSegments = parsed.pathname.split('/').filter(Boolean);
+  const rawLastSegment = pathSegments.pop() || '';
+  const hasExt = rawLastSegment.includes('.');
+  const ext = hasExt ? rawLastSegment.split('.').pop()?.toLowerCase() || 'bin' : 'bin';
+  const filename = decodeURIComponent(rawLastSegment || `download.${ext}`);
   const contentRange = response.headers['content-range'];
   let sizeBytes = response.headers['content-length']
     ? parseInt(response.headers['content-length'], 10)
@@ -165,10 +291,27 @@ export async function downloadStream(url, options = {}) {
     }
   }
 
+  if (spooledTempPath) {
+    const fileReadStream = fs.createReadStream(spooledTempPath);
+    fileReadStream.on('close', () => {
+      fs.promises.unlink(spooledTempPath).catch(() => {});
+    });
+    return {
+      stream: fileReadStream,
+      filename,
+      mimeType: response.headers['content-type'] || mime.lookup(ext) || 'application/octet-stream',
+      sizeBytes,
+      statusCode: response.status,
+      contentRange: response.headers['content-range'],
+    };
+  }
+
   return {
     stream: response.data,
     filename,
     mimeType: response.headers['content-type'] || mime.lookup(ext) || 'application/octet-stream',
     sizeBytes,
+    statusCode: response.status,
+    contentRange: response.headers['content-range'],
   };
 }

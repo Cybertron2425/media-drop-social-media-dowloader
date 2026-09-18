@@ -6,10 +6,11 @@ import { TwitterAdapter } from './twitter.js';
 import { ThreadsAdapter } from './threads.js';
 import { PublicMediaAdapter } from './publicMedia.js';
 import { YouTubeAdapter } from './youtubeAdapter.js';
+import { PornhubAdapter } from './pornhubAdapter.js';
 
 /**
  * Platform registry:
- * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, Threads
+ * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, Threads, YouTube, Pornhub
  * - Generic adapter: PublicMediaAdapter for legitimate third-party public media
  */
 const adapters = [
@@ -20,6 +21,7 @@ const adapters = [
   new TwitterAdapter(),
   new ThreadsAdapter(),
   new YouTubeAdapter(),
+  new PornhubAdapter(),
   new PublicMediaAdapter(),
 ];
 
