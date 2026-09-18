@@ -743,7 +743,7 @@ export async function downloadSegmentsInOrder({
   signal = null,
   proxy = null,
   preDownloadedChunk = null,
-  maxBytes = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 500) * 1024 * 1024,
+  maxBytes = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 6144) * 1024 * 1024,
 }) {
   const combinedWriteStream = fs.createWriteStream(combinedTsPath);
 

@@ -28,7 +28,13 @@ import {
 } from './platforms/pornhubAdapter.js';
 import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
-import { checkNeedsMerge, mergeMediaFiles } from './controllers/downloadController.js';
+import {
+  checkNeedsMerge,
+  mergeMediaFiles,
+  DEFAULT_MAX_FILE_SIZE_MB,
+  getMaxFileSizeMB,
+  getMaxFileSizeBytes,
+} from './controllers/downloadController.js';
 import { createDownloadToken, consumeDownloadToken } from './services/downloadTokenStore.js';
 
 function makeRequest(server, options, bodyData = null) {
@@ -2564,6 +2570,214 @@ seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcd
     } finally {
       axios.get = origGet;
       console.log = origLog;
+    }
+  });
+
+  // 60. Default limit is 6144 MB (6 GB) and MAX_FILE_SIZE_MB env overrides default
+  await t.test('60. Default limit is 6144 MB (6 GB) and MAX_FILE_SIZE_MB env overrides default', () => {
+    assert.strictEqual(DEFAULT_MAX_FILE_SIZE_MB, 6144);
+    assert.strictEqual(6144 * 1024 * 1024, 6442450944);
+
+    const origEnv = process.env.MAX_FILE_SIZE_MB;
+    try {
+      delete process.env.MAX_FILE_SIZE_MB;
+      assert.strictEqual(getMaxFileSizeMB(), 6144);
+      assert.strictEqual(getMaxFileSizeBytes(), 6144 * 1024 * 1024);
+
+      process.env.MAX_FILE_SIZE_MB = '2048';
+      assert.strictEqual(getMaxFileSizeMB(), 2048);
+      assert.strictEqual(getMaxFileSizeBytes(), 2048 * 1024 * 1024);
+
+      process.env.MAX_FILE_SIZE_MB = '6144';
+      assert.strictEqual(getMaxFileSizeMB(), 6144);
+      assert.strictEqual(getMaxFileSizeBytes(), 6442450944);
+    } finally {
+      if (origEnv !== undefined) {
+        process.env.MAX_FILE_SIZE_MB = origEnv;
+      } else {
+        delete process.env.MAX_FILE_SIZE_MB;
+      }
+    }
+  });
+
+  // 61. 1080p files below 6 GB are allowed
+  await t.test('61. 1080p files below 6 GB are allowed through validation and direct URL checks', async () => {
+    const { default: app } = await import('./app.js');
+    const server = http.createServer(app);
+    await new Promise((res) => server.listen(0, res));
+
+    const origEnv = process.env.MAX_FILE_SIZE_MB;
+    process.env.MAX_FILE_SIZE_MB = '6144';
+
+    try {
+      // 5 GB file (below 6 GB limit)
+      const fiveGbBytes = 5 * 1024 * 1024 * 1024;
+      const token = createDownloadToken({
+        platform: 'pornhub',
+        formatId: 'ph-1080p',
+        sourceUrl: 'https://ev.phncdn.com/videos/1080P_large.mp4',
+        meta: {
+          title: 'Large 1080p Video',
+          quality: '1080p',
+          sizeBytes: fiveGbBytes,
+          videoUrl: 'https://ev.phncdn.com/videos/1080P_large.mp4',
+        },
+      });
+
+      const res = await makeRequest(server, {
+        path: `/api/download/${token}/validate`,
+        method: 'POST',
+      });
+      assert.strictEqual(res.statusCode, 200, '5 GB file below 6 GB limit must be allowed (HTTP 200)');
+      const data = res.json();
+      assert.strictEqual(data.success, true);
+    } finally {
+      if (origEnv !== undefined) {
+        process.env.MAX_FILE_SIZE_MB = origEnv;
+      } else {
+        delete process.env.MAX_FILE_SIZE_MB;
+      }
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
+    }
+  });
+
+  // 62. Files above 6 GB are rejected with HTTP 413
+  await t.test('62. Files above 6 GB are rejected with HTTP 413 and correct error message', async () => {
+    const { default: app } = await import('./app.js');
+    const server = http.createServer(app);
+    await new Promise((res) => server.listen(0, res));
+
+    const origEnv = process.env.MAX_FILE_SIZE_MB;
+    process.env.MAX_FILE_SIZE_MB = '6144';
+
+    try {
+      // 6.1 GB file (exceeds 6144 MB)
+      const oversizedBytes = (6144 + 100) * 1024 * 1024;
+      const token = createDownloadToken({
+        platform: 'pornhub',
+        formatId: 'ph-oversized',
+        sourceUrl: 'https://ev.phncdn.com/videos/oversized_6gb.mp4',
+        meta: {
+          title: 'Oversized 6GB Video',
+          sizeBytes: oversizedBytes,
+        },
+      });
+
+      const res = await makeRequest(server, {
+        path: `/api/download/${token}/validate`,
+        method: 'POST',
+      });
+      assert.strictEqual(res.statusCode, 413, 'Files above 6 GB must return HTTP 413');
+      const data = res.json();
+      assert.strictEqual(data.success, false);
+      assert.strictEqual(data.error, 'This file exceeds the maximum allowed download size.');
+    } finally {
+      if (origEnv !== undefined) {
+        process.env.MAX_FILE_SIZE_MB = origEnv;
+      } else {
+        delete process.env.MAX_FILE_SIZE_MB;
+      }
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
+    }
+  });
+
+  // 63. HLS segment assembly stops when accumulated file size reaches 6 GB
+  await t.test('63. HLS segment assembly stops immediately when accumulated file size reaches the configured limit', async () => {
+    const tempDir = path.join(os.tmpdir(), `md_hls_size_test_${nanoid(8)}`);
+    await fs.promises.mkdir(tempDir, { recursive: true });
+    const combinedTsPath = path.join(tempDir, 'combined.ts');
+    const segmentUrls = ['https://example.com/seg0.ts', 'https://example.com/seg1.ts', 'https://example.com/seg2.ts'];
+
+    const origGet = axios.get;
+    const fakeChunk = Buffer.alloc(2000, 0x47); // 2 KB chunk
+
+    axios.get = async () => ({
+      status: 200,
+      data: Readable.from([fakeChunk]),
+      headers: { 'content-type': 'video/mp2t' },
+    });
+
+    try {
+      // Set limit to 3000 bytes (stops after second 2KB chunk exceeds 3KB)
+      await assert.rejects(
+        () => downloadSegmentsInOrder({
+          segmentUrls,
+          tempDir,
+          combinedTsPath,
+          headers: {},
+          concurrency: 1,
+          retries: 1,
+          maxBytes: 3000,
+        }),
+        (err) => {
+          assert.strictEqual(err.message, 'This file exceeds the maximum allowed download size.');
+          return true;
+        }
+      );
+    } finally {
+      axios.get = origGet;
+      await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  // 64. MAX_FILE_SIZE_MB environment variable dynamically overrides default limit in controllers
+  await t.test('64. MAX_FILE_SIZE_MB environment variable dynamically overrides default limit', async () => {
+    const { default: app } = await import('./app.js');
+    const server = http.createServer(app);
+    await new Promise((res) => server.listen(0, res));
+
+    const origEnv = process.env.MAX_FILE_SIZE_MB;
+
+    try {
+      // Set limit to 10 MB
+      process.env.MAX_FILE_SIZE_MB = '10';
+
+      // 15 MB file should now be rejected with 413
+      const fifteenMbBytes = 15 * 1024 * 1024;
+      const token = createDownloadToken({
+        platform: 'pornhub',
+        formatId: 'ph-env-override',
+        sourceUrl: 'https://ev.phncdn.com/videos/15mb.mp4',
+        meta: {
+          title: '15MB Video',
+          sizeBytes: fifteenMbBytes,
+        },
+      });
+
+      const res = await makeRequest(server, {
+        path: `/api/download/${token}/validate`,
+        method: 'POST',
+      });
+      assert.strictEqual(res.statusCode, 413);
+      const data = res.json();
+      assert.strictEqual(data.error, 'This file exceeds the maximum allowed download size.');
+
+      // 5 MB file should still pass under the 10 MB limit
+      const fiveMbToken = createDownloadToken({
+        platform: 'pornhub',
+        formatId: 'ph-5mb',
+        sourceUrl: 'https://ev.phncdn.com/videos/5mb.mp4',
+        meta: {
+          title: '5MB Video',
+          sizeBytes: 5 * 1024 * 1024,
+        },
+      });
+
+      const resPass = await makeRequest(server, {
+        path: `/api/download/${fiveMbToken}/validate`,
+        method: 'POST',
+      });
+      assert.strictEqual(resPass.statusCode, 200);
+    } finally {
+      if (origEnv !== undefined) {
+        process.env.MAX_FILE_SIZE_MB = origEnv;
+      } else {
+        delete process.env.MAX_FILE_SIZE_MB;
+      }
+      if (server.closeAllConnections) server.closeAllConnections();
+      await new Promise((res) => server.close(res));
     }
   });
 

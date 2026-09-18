@@ -23,7 +23,18 @@ if (ffmpegInstaller) {
   ffmpeg.setFfmpegPath(ffmpegInstaller);
 }
 
-const MAX_FILE_SIZE_BYTES = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 500) * 1024 * 1024;
+export const DEFAULT_MAX_FILE_SIZE_MB = 6144;
+
+export function getMaxFileSizeMB() {
+  const parsed = parseInt(process.env.MAX_FILE_SIZE_MB, 10);
+  return !isNaN(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_FILE_SIZE_MB;
+}
+
+export function getMaxFileSizeBytes() {
+  return getMaxFileSizeMB() * 1024 * 1024;
+}
+
+export const MAX_FILE_SIZE_BYTES = (parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 6144) * 1024 * 1024;
 const MAX_DOWNLOAD_TIME_MS = (parseInt(process.env.MAX_DOWNLOAD_TIME_SECONDS, 10) || 300) * 1000;
 // Prepare step includes FFmpeg remuxing which can take significantly longer for 4K content.
 const MAX_PREPARE_TIME_MS = Math.max(MAX_DOWNLOAD_TIME_MS, 15 * 60 * 1000);
@@ -101,7 +112,7 @@ export async function directUrlHandler(req, res) {
   }
 
   // If size is already known and exceeds the configured limit, reject upfront
-  if (token.meta?.sizeBytes && token.meta.sizeBytes > MAX_FILE_SIZE_BYTES) {
+  if (token.meta?.sizeBytes && token.meta.sizeBytes > getMaxFileSizeBytes()) {
     return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
   }
 
@@ -148,7 +159,7 @@ export async function validateDownloadHandler(req, res) {
   }
 
   // If size is already known and exceeds the configured limit, reject upfront
-  if (token.meta?.sizeBytes && token.meta.sizeBytes > MAX_FILE_SIZE_BYTES) {
+  if (token.meta?.sizeBytes && token.meta.sizeBytes > getMaxFileSizeBytes()) {
     return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
   }
 
@@ -169,7 +180,7 @@ export async function validateDownloadHandler(req, res) {
       if (cl) {
         const sizeBytes = parseInt(cl, 10);
         token.meta.sizeBytes = sizeBytes;
-        if (sizeBytes > MAX_FILE_SIZE_BYTES) {
+        if (sizeBytes > getMaxFileSizeBytes()) {
           return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
         }
       }
@@ -197,7 +208,7 @@ export async function validateDownloadHandler(req, res) {
 /**
  * Pipes a readable stream into a temporary file on disk with proper extension.
  */
-async function pipeStreamToTempFile(stream, defaultExt = 'mp4', maxBytes = MAX_FILE_SIZE_BYTES) {
+async function pipeStreamToTempFile(stream, defaultExt = 'mp4', maxBytes = getMaxFileSizeBytes()) {
   const ext = defaultExt.toLowerCase().includes('webm') ? 'webm' : 'mp4';
   const filePath = path.join(os.tmpdir(), `md_video_${nanoid(8)}.${ext}`);
   let bytesWritten = 0;
@@ -225,7 +236,7 @@ async function pipeStreamToTempFile(stream, defaultExt = 'mp4', maxBytes = MAX_F
  * Downloads a remote URL (such as an audio track) to a temporary file on disk with proper extension.
  * Reuses downloadStream to inherit proxy rotation, retry, and SSRF validation.
  */
-async function downloadUrlToTempFile(url, defaultExt = 'm4a', headers = {}, maxBytes = MAX_FILE_SIZE_BYTES) {
+async function downloadUrlToTempFile(url, defaultExt = 'm4a', headers = {}, maxBytes = getMaxFileSizeBytes()) {
   const result = await downloadStream(url, {
     sourceUrl: url,
     meta: { headers },
@@ -353,7 +364,7 @@ export async function prepareDownloadHandler(req, res) {
 
     // Pre-stream size check: if the adapter already knows the file size (from
     // Content-Length), reject immediately before wasting bandwidth or disk space.
-    if (result.sizeBytes && result.sizeBytes > MAX_FILE_SIZE_BYTES) {
+    if (result.sizeBytes && result.sizeBytes > getMaxFileSizeBytes()) {
       result.stream?.destroy?.();
       clearTimeout(timer);
       return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
@@ -416,7 +427,7 @@ export async function prepareDownloadHandler(req, res) {
       return res.status(502).json({ success: false, error: 'Downloaded file is empty. Please try again.' });
     }
 
-    if (stat.size > MAX_FILE_SIZE_BYTES) {
+    if (stat.size > getMaxFileSizeBytes()) {
       await fs.promises.unlink(filePath).catch(() => { });
       clearTimeout(timer);
       return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
@@ -636,7 +647,7 @@ async function streamDownload(downloadId, req, res) {
       headers: req.headers.range ? { Range: req.headers.range } : {},
     });
 
-    if (result.sizeBytes && result.sizeBytes > MAX_FILE_SIZE_BYTES) {
+    if (result.sizeBytes && result.sizeBytes > getMaxFileSizeBytes()) {
       clearTimeout(stallTimer);
       result.stream.destroy?.();
       return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
@@ -659,7 +670,7 @@ async function streamDownload(downloadId, req, res) {
     result.stream.on('data', (chunk) => {
       resetStallTimer();
       bytesStreamed += chunk.length;
-      if (bytesStreamed > MAX_FILE_SIZE_BYTES) {
+      if (bytesStreamed > getMaxFileSizeBytes()) {
         clearTimeout(stallTimer);
         result.stream.destroy();
         res.destroy();
@@ -843,7 +854,7 @@ export async function bulkDownloadHandler(req, res) {
             const ws = fs.createWriteStream(tempFilePath);
             result.stream.on('data', (chunk) => {
               fileBytes += chunk.length;
-              if (totalBytesWritten + fileBytes > MAX_FILE_SIZE_BYTES * 2) {
+              if (totalBytesWritten + fileBytes > getMaxFileSizeBytes() * 2) {
                 ws.destroy();
                 result.stream.destroy();
                 reject(new Error('Bulk download exceeds maximum allowed size.'));
