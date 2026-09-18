@@ -123,7 +123,7 @@ export async function directUrlHandler(req, res) {
       success: false,
       requiresPrepare: true,
       fallback: true,
-      error: 'Direct URL not available.',
+      error: 'Invalid source URL for direct download.',
     });
   }
 
@@ -137,8 +137,9 @@ export async function directUrlHandler(req, res) {
 }
 
 /**
- * Confirms a downloadId is still valid WITHOUT consuming it.
- * The frontend calls this first so it can show a clear error instead of a silent failure.
+ * Validates a download request before starting preparation or streaming.
+ * Checks token validity, format availability, size limits, and flags whether
+ * server-side preparation (audio/video merging or progressive downloading) is required.
  */
 export async function validateDownloadHandler(req, res) {
   const token = peekDownloadToken(req.params.downloadId);
