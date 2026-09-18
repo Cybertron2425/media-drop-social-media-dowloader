@@ -1105,12 +1105,12 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
     }
   });
 
-  // 30. Same proxy is reused for playlist + segments
-  await t.test('30. same proxy is reused for playlist + segments', async () => {
+  // 30. Pornhub HLS uses direct connection without proxy for playlist + segments
+  await t.test('30. Pornhub HLS uses direct connection without proxy for playlist + segments', async () => {
     const origGet = axios.get;
-    const requestedProxies = [];
+    const requestedRequests = [];
     const dummyProxy = { display: '1.2.3.4:8080', url: 'http://1.2.3.4:8080' };
-    const tmpOut = path.join(os.tmpdir(), `md_test_proxy_${nanoid(8)}.mp4`);
+    const tmpOut = path.join(os.tmpdir(), `md_test_direct_${nanoid(8)}.mp4`);
     const tmpTs = path.join(os.tmpdir(), `md_test_seg_${nanoid(8)}.ts`);
 
     const { default: ffmpeg } = await import('fluent-ffmpeg');
@@ -1131,7 +1131,7 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
 
     try {
       axios.get = async (url, config) => {
-        requestedProxies.push({ url, hasAgent: Boolean(config.httpsAgent || config.httpAgent) });
+        requestedRequests.push({ url, hasAgent: Boolean(config.httpsAgent || config.httpAgent) });
 
         if (url.includes('master.m3u8')) {
           return {
@@ -1161,9 +1161,9 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
         proxy: dummyProxy,
       });
 
-      assert.ok(requestedProxies.length >= 3, 'Must have fetched master, media, and segment');
-      for (const req of requestedProxies) {
-        assert.strictEqual(req.hasAgent, true, `Request to ${req.url} must use the session proxy agent`);
+      assert.ok(requestedRequests.length >= 3, 'Must have fetched master, media, and segment');
+      for (const req of requestedRequests) {
+        assert.strictEqual(req.hasAgent, false, `Request to ${req.url} must use DIRECT connection (no proxy agent)`);
       }
       assert.ok(fs.existsSync(tmpOut), 'Output MP4 must be created');
     } finally {
@@ -1208,18 +1208,18 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
     }
   });
 
-  // 32. Retry does not rotate to a different proxy within the same HLS session
-  await t.test('32. retry does not rotate to a different proxy within the same HLS session', async () => {
+  // 32. Retry uses direct connection without proxy
+  await t.test('32. retry uses direct connection and does not use proxy', async () => {
     const origGet = axios.get;
     let attempts = 0;
     const dummyProxy = { display: '9.9.9.9:8080', url: 'http://9.9.9.9:8080' };
-    const tmpChunk = path.join(os.tmpdir(), `md_test_retry_proxy_${nanoid(8)}.ts`);
+    const tmpChunk = path.join(os.tmpdir(), `md_test_retry_direct_${nanoid(8)}.ts`);
 
     try {
       axios.get = async (url, config) => {
         if (url.includes('retry-proxy-segment.ts')) {
           attempts++;
-          assert.ok(config.httpsAgent || config.httpAgent, 'Must have proxy agent attached');
+          assert.strictEqual(Boolean(config.httpsAgent || config.httpAgent), false, 'Must NOT have proxy agent attached');
           if (attempts === 1) {
             const err = new Error('Transient socket reset');
             err.code = 'ECONNRESET';
@@ -1289,14 +1289,39 @@ seg-2.ts?validfrom=100&validto=200&hash=abc
     }
   });
 
-  // 34. Same proxy across get_media -> playlist -> segment
-  await t.test('34. same proxy endpoint is maintained across get_media -> playlist -> segment', async () => {
-    const dummyProxy = { url: 'http://user:pass@127.0.0.1:8888', display: '127.0.0.1:8888' };
-    const proxyIdentifier = getProxyIdentifier(dummyProxy);
-    assert.strictEqual(proxyIdentifier, '127.0.0.1:8888');
+  // 34. Pornhub pipeline (analyze, get_media, playlist, segment) strictly uses direct connection
+  await t.test('34. Pornhub pipeline (analyze, get_media, playlist, segment) strictly uses direct connection', async () => {
+    const origGet = axios.get;
+    const directCalls = [];
 
-    const directIdentifier = getProxyIdentifier(null);
-    assert.strictEqual(directIdentifier, 'direct (no proxy)');
+    try {
+      axios.get = async (url, config = {}) => {
+        directCalls.push({ url, hasProxy: Boolean(config.httpsAgent || config.httpAgent) });
+        if (url.includes('view_video.php')) {
+          return {
+            status: 200,
+            data: '<script>var flashvars_1 = {"video_title":"Direct Test","mediaDefinitions":[{"format":"hls","quality":"720","height":720,"videoUrl":"https://ev-h.phncdn.com/test.m3u8"}]};</script>',
+          };
+        }
+        if (url.includes('get_media')) {
+          return {
+            status: 200,
+            data: [{ format: 'hls', quality: '720', height: 720, videoUrl: 'https://ev-h.phncdn.com/fresh.m3u8' }],
+          };
+        }
+        return origGet(url, config);
+      };
+
+      const analyzeResult = await adapter.analyze('https://www.pornhub.com/view_video.php?viewkey=direct123');
+      assert.ok(analyzeResult.formats.length > 0);
+      assert.strictEqual(analyzeResult.formats[0].meta.proxy, null, 'Format metadata proxy must be null');
+
+      for (const call of directCalls) {
+        assert.strictEqual(call.hasProxy, false, `Call to ${call.url} must NOT use proxy agent`);
+      }
+    } finally {
+      axios.get = origGet;
+    }
   });
 
   // 35. Same User-Agent consistency

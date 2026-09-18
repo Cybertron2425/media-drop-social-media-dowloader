@@ -452,13 +452,14 @@ function sanitizeTextSnippet(text) {
  */
 export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy = null, signal = null } = {}) {
   const sanitizedUrl = sanitizeUrlForLogging(firstSegmentUrl);
-  const proxyDisplay = getProxyIdentifier(proxy);
+  const proxyDisplay = getProxyIdentifier(null);
 
   let diagRes;
   try {
     diagRes = await fetchWithProxy(firstSegmentUrl, {
       headers,
-      proxy,
+      proxy: false,
+      direct: true,
       timeout: 15000,
       responseType: 'arraybuffer',
       signal,
@@ -485,12 +486,12 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
     ? first1KbBuf.toString('utf8').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 1024)
     : null;
 
-  logRequestContext('First Segment Probe', firstSegmentUrl, headers, status, respHeaders, proxy);
+  logRequestContext('First Segment Probe', firstSegmentUrl, headers, status, respHeaders, null);
 
   if (status === 470 || isDebugHls()) {
     console.log('=== [HLS First Segment Diagnostic Probe] ===');
     console.log(`- Sanitized URL: ${sanitizedUrl}`);
-    console.log(`- Proxy endpoint: ${proxyDisplay}`);
+    console.log(`- Proxy endpoint: direct (no proxy)`);
     console.log(`- HTTP status: ${status}`);
     console.log(`- Content-Type: ${contentType}`);
     console.log(`- Content-Length: ${contentLength}`);
@@ -526,8 +527,6 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
       probableCause = 'CDN anti-bot / security challenge response';
     } else if (isGeoBlocked) {
       probableCause = 'geo/datacenter restriction';
-    } else if (!proxy) {
-      probableCause = 'signed URL/IP mismatch (direct connection used for segment while API was proxy/different IP)';
     } else if (!hasCookies) {
       probableCause = 'missing cookie/session headers';
     } else if (!headers['Referer'] && !headers['referer']) {
@@ -535,7 +534,7 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
     } else if (!hasAuthToken && !hasExpiry) {
       probableCause = 'missing/expired signature';
     } else {
-      probableCause = 'IP authorization mismatch or wrong CDN hostname (redirect target mismatch)';
+      probableCause = 'Pornhub CDN authorization / IP signature rejection (direct connection)';
     }
 
     console.error('[HLS Segment Diagnostic 470 Assessment]:', {
@@ -562,7 +561,7 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
 }
 
 /**
- * Downloads an individual segment with retry & exponential backoff.
+ * Downloads an individual segment with retry & exponential backoff using Render server's DIRECT internet connection.
  * Streams response directly to a temporary chunk file on disk (zero memory buffering).
  */
 export async function downloadSegmentToFile(
@@ -581,8 +580,9 @@ export async function downloadSegmentToFile(
     try {
       const res = await fetchWithProxy(segmentUrl, {
         headers,
-        proxy,
-        timeout: 15000,
+        proxy: false,
+        direct: true,
+        timeout: 30000,
         responseType: 'stream',
         signal,
         validateStatus: (s) => s === 200,
@@ -607,7 +607,7 @@ export async function downloadSegmentToFile(
         await fs.promises.unlink(chunkFilePath);
       } catch {}
 
-      // If Pornhub CDN rejected with HTTP 470, do NOT retry repeatedly
+      // If Pornhub CDN rejected with HTTP 470, fail-fast immediately without retrying
       if (err.response?.status === 470) {
         throw new PlatformLimitationError('Pornhub CDN rejected the HLS segment request (HTTP 470).');
       }
@@ -620,6 +620,9 @@ export async function downloadSegmentToFile(
         await new Promise((r) => setTimeout(r, delayMs));
       }
     }
+  }
+  if (lastErr?.code === 'ETIMEDOUT' || lastErr?.code === 'ECONNABORTED' || lastErr?.message?.includes('timeout')) {
+    throw new PlatformLimitationError('Connection timed out while downloading video segment.');
   }
   throw new Error(`Failed to download segment after ${retries} attempts: ${lastErr?.message || 'Network error'}`);
 }
@@ -833,7 +836,6 @@ export function remuxTsToMp4WithFfmpeg(localTsPath, outputPath, options = {}) {
  */
 export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
   let sessionCookies = options.cookie || options.headers?.Cookie || CONSENT_COOKIES;
-  const activeProxy = options.proxy || null;
 
   const baseHeaders = {
     'User-Agent': DEFAULT_USER_AGENT,
@@ -852,15 +854,16 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
   const retries = options.retries || 3;
   const signal = options.signal || null;
 
-  // 1. Fetch playlist in Node using session proxy if available
+  // 1. Fetch playlist in Node using Render server's DIRECT internet connection
   const playlistRes = await fetchWithProxy(playlistUrl, {
     headers: baseHeaders,
-    proxy: activeProxy,
-    timeout: 10000,
+    proxy: false,
+    direct: true,
+    timeout: 15000,
     validateStatus: () => true,
   });
 
-  const sessionProxy = activeProxy || playlistRes.proxy || null;
+  const sessionProxy = null;
   sessionCookies = mergeCookies(sessionCookies, playlistRes.headers?.['set-cookie']);
   baseHeaders.Cookie = sessionCookies;
 
@@ -894,8 +897,9 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
 
     const childRes = await fetchWithProxy(childUrl, {
       headers: baseHeaders,
-      proxy: sessionProxy,
-      timeout: 10000,
+      proxy: false,
+      direct: true,
+      timeout: 15000,
       validateStatus: () => true,
     });
 
@@ -944,7 +948,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
   const combinedTsPath = path.join(tempDir, 'combined.ts');
 
   try {
-    // 6. Diagnostic probe on the first segment URL using identical session context
+    // 6. Diagnostic probe on the first segment URL using identical session context (direct connection)
     const firstSegmentUrl = segmentUrls[0];
     const segmentHeaders = {
       ...baseHeaders,
@@ -954,7 +958,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
 
     const probeRes = await probeFirstSegment(firstSegmentUrl, {
       headers: segmentHeaders,
-      proxy: sessionProxy,
+      proxy: null,
       signal,
     });
 
@@ -968,7 +972,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
     const seg0Path = path.join(tempDir, 'seg_0.ts');
     await fs.promises.writeFile(seg0Path, probeRes.data);
 
-    // 7. Download remaining segments in parallel batches & stream to combined.ts strictly in order
+    // 7. Download remaining segments in parallel batches & stream to combined.ts strictly in order (direct connection)
     await downloadSegmentsInOrder({
       segmentUrls,
       tempDir,
@@ -977,7 +981,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
       concurrency,
       retries,
       signal,
-      proxy: sessionProxy,
+      proxy: null,
       preDownloadedChunk: { index: 0 },
     });
 
@@ -1050,6 +1054,8 @@ export class PornhubAdapter extends BaseAdapter {
     try {
       response = await fetchWithProxy(pageUrl, {
         headers,
+        proxy: false,
+        direct: true,
         timeout: 15000,
         validateStatus: () => true,
       });
@@ -1206,13 +1212,13 @@ export class PornhubAdapter extends BaseAdapter {
       }
     }
 
-    const pageProxy = response.proxy || null;
+    const pageProxy = null;
     let sessionCookies = mergeCookies(CONSENT_COOKIES, response.headers?.['set-cookie']);
     logRequestContext('Page Load', pageUrl, headers, response.status, response.headers, pageProxy);
 
     let getMediaItems = [];
 
-    // Query remote get_media if available
+    // Query remote get_media if available using Render server's DIRECT internet connection
     if (remoteDef) {
       try {
         const getMediaHeaders = {
@@ -1224,8 +1230,9 @@ export class PornhubAdapter extends BaseAdapter {
         };
         const getMediaRes = await fetchWithProxy(remoteDef.videoUrl, {
           headers: getMediaHeaders,
-          proxy: pageProxy,
-          timeout: 10000,
+          proxy: false,
+          direct: true,
+          timeout: 15000,
           validateStatus: () => true,
         });
 
@@ -1434,7 +1441,7 @@ export class PornhubAdapter extends BaseAdapter {
       if (base) filename = `${base}.${format}`;
     }
 
-    const activeProxy = options.meta?.proxy || options.proxy || null;
+    const activeProxy = null;
 
     const baseHeaders = {
       'User-Agent': DEFAULT_USER_AGENT,
@@ -1470,7 +1477,8 @@ export class PornhubAdapter extends BaseAdapter {
               Accept: 'application/json, text/javascript, */*; q=0.01',
               Cookie: baseHeaders.Cookie,
             },
-            proxy: activeProxy,
+            proxy: false,
+            direct: true,
             timeout: 6000,
             validateStatus: () => true,
           });
@@ -1491,7 +1499,7 @@ export class PornhubAdapter extends BaseAdapter {
             },
             freshRes.status,
             freshRes.headers,
-            activeProxy
+            null
           );
 
           if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
@@ -1502,21 +1510,13 @@ export class PornhubAdapter extends BaseAdapter {
                 typeof d.videoUrl === 'string' &&
                 (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
             );
+            const match = hlsCandidates.find(
+              (d) => String(d.quality) === reqQuality || String(d.height) === reqQuality
+            ) || hlsCandidates[0];
 
-            if (hlsCandidates.length > 0) {
-              hlsCandidates.sort((a, b) => {
-                const aHas = a.videoUrl.includes('validfrom=') || a.videoUrl.includes('hash=');
-                const bHas = b.videoUrl.includes('validfrom=') || b.videoUrl.includes('hash=');
-                return (bHas ? 1 : 0) - (aHas ? 1 : 0);
-              });
-              const match = hlsCandidates.find(
-                (d) => String(d.quality) === reqQuality || String(d.height) === reqQuality
-              ) || hlsCandidates[0];
-
-              if (match?.videoUrl) {
-                hlsUrl = match.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
-                console.log(`[HLS Origin Selection]: Refreshed HLS URL from fresh get_media (URL: ${sanitizeUrlForLogging(hlsUrl)})`);
-              }
+            if (match?.videoUrl) {
+              hlsUrl = match.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+              console.log(`[HLS Origin Selection]: Refreshed HLS URL from fresh get_media (URL: ${sanitizeUrlForLogging(hlsUrl)})`);
             }
           }
         } catch {}
@@ -1526,7 +1526,7 @@ export class PornhubAdapter extends BaseAdapter {
       let verifiedPlaylistSnippet = null;
       let targetMediaUrl = null;
 
-      // Helper to verify a URL and resolve if master playlist
+      // Helper to verify a URL and resolve if master playlist using Render server's DIRECT internet connection
       const verifyAndResolve = async (candidateUrl) => {
         let normalized = candidateUrl;
         if (normalized.includes('hv-h.phncdn.com')) {
@@ -1535,7 +1535,8 @@ export class PornhubAdapter extends BaseAdapter {
 
         const res = await fetchWithProxy(normalized, {
           headers: baseHeaders,
-          proxy: activeProxy,
+          proxy: false,
+          direct: true,
           timeout: 8000,
           validateStatus: () => true,
         });
@@ -1545,8 +1546,8 @@ export class PornhubAdapter extends BaseAdapter {
         }
 
         const resolvedPlaylistUrl = res.finalUrl || normalized;
-        logRedirectDiagnostics('Pre-check Master', normalized, resolvedPlaylistUrl, res.redirects || [], activeProxy);
-        logRequestContext('Pre-check Master', normalized, baseHeaders, res.status, res.headers, activeProxy);
+        logRedirectDiagnostics('Pre-check Master', normalized, resolvedPlaylistUrl, res.redirects || [], null);
+        logRequestContext('Pre-check Master', normalized, baseHeaders, res.status, res.headers, null);
 
         if (res.status !== 200 || typeof res.data !== 'string' || !res.data.includes('#EXTM3U')) {
           return null;
@@ -1563,7 +1564,8 @@ export class PornhubAdapter extends BaseAdapter {
 
           const childRes = await fetchWithProxy(childUrl, {
             headers: baseHeaders,
-            proxy: activeProxy,
+            proxy: false,
+            direct: true,
             timeout: 8000,
             validateStatus: () => true,
           });
@@ -1573,8 +1575,8 @@ export class PornhubAdapter extends BaseAdapter {
           }
 
           const resolvedChildUrl = childRes.finalUrl || childUrl;
-          logRedirectDiagnostics('Pre-check Variant', childUrl, resolvedChildUrl, childRes.redirects || [], activeProxy);
-          logRequestContext('Pre-check Variant', childUrl, baseHeaders, childRes.status, childRes.headers, activeProxy);
+          logRedirectDiagnostics('Pre-check Variant', childUrl, resolvedChildUrl, childRes.redirects || [], null);
+          logRequestContext('Pre-check Variant', childUrl, baseHeaders, childRes.status, childRes.headers, null);
 
           if (
             childRes.status === 200 &&
@@ -1613,7 +1615,8 @@ export class PornhubAdapter extends BaseAdapter {
         try {
           const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
             headers: baseHeaders,
-            proxy: activeProxy,
+            proxy: false,
+            direct: true,
             timeout: 10000,
             validateStatus: () => true,
           });
@@ -1663,7 +1666,8 @@ export class PornhubAdapter extends BaseAdapter {
           cookie: baseHeaders.Cookie,
           referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
           pageUrl: options.meta?.pageUrl || 'https://www.pornhub.com/',
-          proxy: activeProxy,
+          proxy: null,
+          direct: true,
           quality: options.meta?.quality,
           preCheckStatus,
           playlistSnippet: verifiedPlaylistSnippet,
@@ -1681,39 +1685,17 @@ export class PornhubAdapter extends BaseAdapter {
           filename,
           mimeType: 'video/mp4',
           sizeBytes: stat.size,
-          statusCode: 200,
+          cleanup: async () => {
+            await fs.promises.unlink(tempFilePath).catch(() => {});
+          },
         };
       } catch (err) {
-        fs.promises.unlink(tempFilePath).catch(() => {});
-        if (err.isSigsegv) {
-          throw err;
-        }
-        if (
-          err.message?.includes('4XX') ||
-          err.message?.includes('410') ||
-          err.message?.includes('404')
-        ) {
-          throw new PlatformLimitationError(
-            'The media stream is no longer available on Pornhub (HTTP 410).'
-          );
-        }
-        if (err.message?.includes('403') || err.message?.includes('401')) {
-          throw new PlatformLimitationError(
-            'Access to this media stream was denied by Pornhub (HTTP 403).'
-          );
-        }
-        if (err instanceof PlatformLimitationError) {
-          throw err;
-        }
-        throw new PlatformLimitationError(
-          `Failed to download HLS video stream: ${err.message}`
-        );
+        await fs.promises.unlink(tempFilePath).catch(() => {});
+        throw err;
       }
     }
 
-    // Case 2: Progressive MP4
-    // Before downloading, try fetching a fresh URL from get_media if available
-    // to ensure the signed token hasn't expired or become stale
+    // Case 2: Progressive MP4 format (direct stream proxy via Render server's DIRECT internet connection)
     if (options.meta?.getMediaUrl) {
       try {
         const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
@@ -1722,6 +1704,8 @@ export class PornhubAdapter extends BaseAdapter {
             Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
             Accept: 'application/json, text/javascript, */*; q=0.01',
           },
+          proxy: false,
+          direct: true,
           timeout: 6000,
           validateStatus: () => true,
         });
@@ -1748,6 +1732,9 @@ export class PornhubAdapter extends BaseAdapter {
     const executeDownload = async (targetUrl) => {
       return await downloadStream(targetUrl, {
         ...options,
+        platform: 'pornhub',
+        direct: true,
+        proxy: false,
         sourceUrl: targetUrl,
         meta: {
           ...(options.meta || {}),
@@ -1774,6 +1761,8 @@ export class PornhubAdapter extends BaseAdapter {
               Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
               Accept: 'application/json, text/javascript, */*; q=0.01',
             },
+            proxy: false,
+            direct: true,
             timeout: 6000,
             validateStatus: () => true,
           });

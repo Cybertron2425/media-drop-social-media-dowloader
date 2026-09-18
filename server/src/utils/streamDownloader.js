@@ -53,8 +53,11 @@ export async function downloadStream(url, options = {}) {
   const customHeaders = options.meta?.headers || {};
 
   const proxies = getProxyList();
+  const isDirect = options.direct === true || options.proxy === false || options.platform === 'pornhub';
   // Randomized order to distribute load across pool, or use specified proxy if provided
-  const attempts = options.proxy
+  const attempts = isDirect
+    ? [null]
+    : options.proxy
     ? [options.proxy]
     : proxies.length > 0
     ? [...proxies].sort(() => Math.random() - 0.5)
@@ -337,7 +340,10 @@ export async function fetchWithProxy(url, options = {}) {
   const validateStatus = options.validateStatus || ((s) => s >= 200 && s < 300);
 
   const proxies = getProxyList();
-  const attempts = options.proxy
+  const isDirect = options.direct === true || options.proxy === false;
+  const attempts = isDirect
+    ? [null]
+    : options.proxy
     ? [options.proxy]
     : proxies.length > 0
     ? [...proxies].sort(() => Math.random() - 0.5)
