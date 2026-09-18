@@ -1511,6 +1511,24 @@ seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcd
           return true;
         }
       );
+      // Case C: CDN requires user authentication
+      axios.get = async () => ({
+        status: 470,
+        data: Buffer.from('<html><body>Unauthorized<br>We\'re sorry, the request requires user authentication</body></html>'),
+        headers: {
+          'content-type': 'text/html',
+        },
+      });
+
+      await assert.rejects(
+        () => probeFirstSegment('https://di-h.phncdn.com/seg.ts?e=123&h=456', {}),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.ok(err.message.includes('HTTP 470'));
+          assert.ok(err.message.includes('requires CDN user authentication'));
+          return true;
+        }
+      );
     } finally {
       axios.get = origGet;
     }
@@ -2154,6 +2172,79 @@ seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcd
     } finally {
       delete process.env.PROXY_LIST;
       axios.get = origGet;
+    }
+  });
+
+  // 53. probeFirstSegment logs HLS CDN Authorization Diagnostic safely without exposing secrets
+  await t.test('53. probeFirstSegment logs HLS CDN Authorization Diagnostic safely without exposing secrets', async () => {
+    const origGet = axios.get;
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => {
+      logs.push(args.join(' '));
+      origLog(...args);
+    };
+
+    try {
+      axios.get = async () => ({
+        status: 470,
+        headers: {
+          'content-type': 'text/html',
+          'server': 'phncdn-edge',
+          'set-cookie': 'secret_cookie=12345',
+        },
+        data: Buffer.from('<html><body>Unauthorized<br>We\'re sorry, the request requires user authentication</body></html>'),
+      });
+
+      await assert.rejects(
+        () => probeFirstSegment('https://di-h.phncdn.com/seg-1.ts?h=very_secret_hash&e=179000000', {
+          headers: {
+            'User-Agent': 'TestAgent',
+            'Referer': 'https://www.pornhub.com/',
+            'Cookie': 'consent=1; session=abc123secret',
+            'Authorization': 'Bearer confidential_token',
+          },
+          playlistContext: {
+            url: 'https://ev-h.phncdn.com/hls/master.m3u8?validfrom=100&hash=secret_playlist_hash',
+            status: 200,
+            contentType: 'application/vnd.apple.mpegurl',
+            headers: {
+              'content-type': 'application/vnd.apple.mpegurl',
+              'set-cookie': 'cdn_token=super_secret',
+            },
+            body: '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:10.0,\nseg-1.ts',
+          },
+        }),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError);
+          assert.ok(err.message.includes('HTTP 470'));
+          assert.ok(err.message.includes('requires CDN user authentication'));
+          return true;
+        }
+      );
+
+      const allLogs = logs.join('\n');
+      assert.ok(allLogs.includes('[HLS CDN Authorization Diagnostic]'), 'Must log [HLS CDN Authorization Diagnostic]');
+      assert.ok(allLogs.includes('- Playlist HTTP status: 200'));
+      assert.ok(allLogs.includes('- Playlist content-type: application/vnd.apple.mpegurl'));
+      assert.ok(allLogs.includes('- Playlist query param names: [validfrom, hash]'));
+      assert.ok(allLogs.includes('- Segment HTTP status: 470'));
+      assert.ok(allLogs.includes('- Segment query param names: [h, e]'));
+      assert.ok(allLogs.includes('- Same hostname (playlist vs segment): false (ev-h.phncdn.com vs di-h.phncdn.com)'));
+      assert.ok(allLogs.includes('- Cookies sent: true'));
+      assert.ok(allLogs.includes('- Authorization header exists: true'));
+      assert.ok(allLogs.includes('- Playlist has EXT-X-KEY: false'));
+      assert.ok(allLogs.includes('- Playlist has EXT-X-MAP: false'));
+
+      // Check that NO secrets or sensitive values are leaked in the diagnostic log
+      assert.ok(!allLogs.includes('very_secret_hash'), 'No segment token secret in log');
+      assert.ok(!allLogs.includes('secret_playlist_hash'), 'No playlist token secret in log');
+      assert.ok(!allLogs.includes('confidential_token'), 'No Authorization value in log');
+      assert.ok(!allLogs.includes('abc123secret'), 'No cookie value in log');
+      assert.ok(!allLogs.includes('super_secret'), 'No set-cookie value in log');
+    } finally {
+      axios.get = origGet;
+      console.log = origLog;
     }
   });
 

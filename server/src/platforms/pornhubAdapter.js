@@ -446,11 +446,24 @@ function sanitizeTextSnippet(text) {
     .replace(/set-cookie:[^\n]+/gi, 'set-cookie: ***');
 }
 
+export function getQueryParamNames(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return [];
+  try {
+    const u = new URL(urlStr);
+    return Array.from(u.searchParams.keys());
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Performs a single diagnostic probe on the first segment URL using the exact session context.
  * Logs diagnostic details without exposing tokens, evaluates HTTP 470 causes, and returns probe result.
  */
-export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy = null, signal = null } = {}) {
+export async function probeFirstSegment(
+  firstSegmentUrl,
+  { headers = {}, proxy = null, signal = null, playlistContext = {} } = {}
+) {
   const sanitizedUrl = sanitizeUrlForLogging(firstSegmentUrl);
   const proxyDisplay = getProxyIdentifier(null);
 
@@ -488,6 +501,43 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
 
   logRequestContext('First Segment Probe', firstSegmentUrl, headers, status, respHeaders, null);
 
+  // Safe HLS CDN Authorization Diagnostic logging (Requirement: safe diagnostics without exposing tokens/secrets)
+  const playlistStatus = playlistContext.status ?? 'unknown';
+  const playlistContentType = playlistContext.contentType || playlistContext.headers?.['content-type'] || 'unknown';
+  const safePlaylistHeaders = sanitizeHeadersForLogging(playlistContext.headers || {});
+  const playlistParamNames = getQueryParamNames(playlistContext.url);
+  const segmentParamNames = getQueryParamNames(firstSegmentUrl);
+
+  let playlistHost = 'unknown';
+  let segmentHost = 'unknown';
+  try {
+    if (playlistContext.url) playlistHost = new URL(playlistContext.url).hostname;
+  } catch {}
+  try {
+    segmentHost = new URL(firstSegmentUrl).hostname;
+  } catch {}
+  const sameHostname = Boolean(playlistHost !== 'unknown' && segmentHost !== 'unknown' && playlistHost === segmentHost);
+
+  const hasCookiesSent = Boolean(headers['Cookie'] || headers['cookie']);
+  const hasAuthHeader = Boolean(headers['Authorization'] || headers['authorization']);
+  const hasExtXKey = typeof playlistContext.body === 'string' && playlistContext.body.includes('#EXT-X-KEY');
+  const hasExtXMap = typeof playlistContext.body === 'string' && playlistContext.body.includes('#EXT-X-MAP');
+
+  console.log('=== [HLS CDN Authorization Diagnostic] ===');
+  console.log(`- Playlist HTTP status: ${playlistStatus}`);
+  console.log(`- Playlist content-type: ${playlistContentType}`);
+  console.log(`- Playlist response headers:`, JSON.stringify(safePlaylistHeaders));
+  console.log(`- Playlist query param names: [${playlistParamNames.join(', ')}]`);
+  console.log(`- Segment HTTP status: ${status}`);
+  console.log(`- Segment response headers:`, JSON.stringify(safeHeaders));
+  console.log(`- Segment query param names: [${segmentParamNames.join(', ')}]`);
+  console.log(`- Same hostname (playlist vs segment): ${sameHostname} (${playlistHost} vs ${segmentHost})`);
+  console.log(`- Cookies sent: ${hasCookiesSent}`);
+  console.log(`- Authorization header exists: ${hasAuthHeader}`);
+  console.log(`- Playlist has EXT-X-KEY: ${hasExtXKey}`);
+  console.log(`- Playlist has EXT-X-MAP: ${hasExtXMap}`);
+  console.log('==========================================');
+
   if (status === 470 || isDebugHls()) {
     console.log('=== [HLS First Segment Diagnostic Probe] ===');
     console.log(`- Sanitized URL: ${sanitizedUrl}`);
@@ -513,21 +563,25 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
     const host = parsedSeg.hostname;
     const hasExpiry = parsedSeg.searchParams?.has('e') || parsedSeg.searchParams?.has('validto');
     const hasAuthToken = parsedSeg.searchParams?.has('h') || parsedSeg.searchParams?.has('hash');
-    const hasCookies = Boolean(headers['Cookie'] || headers['cookie']);
+    const isAuthRequired =
+      Boolean(first1KbText && /requires user authentication|unauthorized/i.test(first1KbText)) ||
+      status === 401;
     const isAntiBot =
-      contentType.includes('html') ||
-      Boolean(respHeaders['cf-ray'] || respHeaders['cf-cache-status']) ||
-      (first1KbText && /captcha|challenge|cloudflare|turnstile|ddos/i.test(first1KbText));
+      !isAuthRequired &&
+      (Boolean(respHeaders['cf-ray'] || respHeaders['cf-cache-status']) ||
+       Boolean(first1KbText && /captcha|challenge|cloudflare|turnstile|ddos/i.test(first1KbText)));
     const isGeoBlocked =
-      (first1KbText && /geo|country|region|not available/i.test(first1KbText)) ||
+      Boolean(first1KbText && /geo|country|region|not available/i.test(first1KbText)) ||
       respHeaders['x-geo-blocked'] === '1';
 
     let probableCause = 'Unknown';
-    if (isAntiBot) {
+    if (isAuthRequired) {
+      probableCause = 'Pornhub CDN requires user authentication / session token';
+    } else if (isAntiBot) {
       probableCause = 'CDN anti-bot / security challenge response';
     } else if (isGeoBlocked) {
       probableCause = 'geo/datacenter restriction';
-    } else if (!hasCookies) {
+    } else if (!hasCookiesSent) {
       probableCause = 'missing cookie/session headers';
     } else if (!headers['Referer'] && !headers['referer']) {
       probableCause = 'missing Referer/Origin';
@@ -541,14 +595,17 @@ export async function probeFirstSegment(firstSegmentUrl, { headers = {}, proxy =
       hostname: host,
       hasExpiry,
       hasAuthToken,
-      hasCookies,
+      hasCookies: hasCookiesSent,
+      isAuthRequired,
       isAntiBot,
       isGeoBlocked,
       probableCause,
       responseSnippet: first1KbText ? sanitizeTextSnippet(first1KbText) : (first32Hex ? `HEX:${first32Hex}` : 'empty'),
     });
 
-    throw new PlatformLimitationError('Pornhub CDN rejected the HLS segment request (HTTP 470).');
+    throw new PlatformLimitationError(
+      'Pornhub CDN rejected the HLS segment request (HTTP 470). The selected HLS stream requires CDN user authentication.'
+    );
   }
 
   return {
@@ -894,6 +951,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
 
   let mediaPlaylistBody = playlistRes.data;
   let mediaPlaylistUrl = resolvedPlaylistUrl;
+  let activePlaylistRes = playlistRes;
 
   // 2. Resolve Master Playlist if needed
   if (mediaPlaylistBody.includes('#EXT-X-STREAM-INF')) {
@@ -914,6 +972,7 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
       validateStatus: () => true,
     });
 
+    activePlaylistRes = childRes;
     sessionCookies = mergeCookies(sessionCookies, childRes.headers?.['set-cookie']);
     baseHeaders.Cookie = sessionCookies;
 
@@ -971,6 +1030,13 @@ export async function downloadHlsToFile(playlistUrl, outPath, options = {}) {
       headers: segmentHeaders,
       proxy: null,
       signal,
+      playlistContext: {
+        url: mediaPlaylistUrl,
+        status: activePlaylistRes?.status,
+        contentType: activePlaylistRes?.headers?.['content-type'],
+        headers: activePlaylistRes?.headers,
+        body: mediaPlaylistBody,
+      },
     });
 
     if (!probeRes.isSuccess || !probeRes.data || probeRes.data.length === 0) {
