@@ -29,7 +29,7 @@ import {
 import { resolveAdapter, getAdapter } from './platforms/registry.js';
 import { PlatformLimitationError } from './platforms/baseAdapter.js';
 import { checkNeedsMerge, mergeMediaFiles } from './controllers/downloadController.js';
-import { createDownloadToken } from './services/downloadTokenStore.js';
+import { createDownloadToken, consumeDownloadToken } from './services/downloadTokenStore.js';
 
 function makeRequest(server, options, bodyData = null) {
   return new Promise((resolve, reject) => {
@@ -650,8 +650,8 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
     }
   });
 
-  // 16. Prefer progressive MP4 over HLS
-  await t.test('16. Quality mapping prefers progressive MP4 over HLS and excludes get_media endpoint', async () => {
+  // 16. Format selection prioritizes HLS over progressive MP4 when available, and excludes get_media endpoint
+  await t.test('16. Quality mapping prioritizes HLS over progressive MP4 and excludes get_media endpoint', async () => {
     const origGet = axios.get;
     try {
       axios.get = async (url) => {
@@ -712,15 +712,53 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
       const result = await adapter.analyze('https://www.pornhub.com/view_video.php?viewkey=multiformat123');
       assert.strictEqual(result.formats.length, 2);
       assert.strictEqual(result.formats[0].quality, '720p');
-      assert.strictEqual(result.formats[0].sourceUrl, 'https://ev.phncdn.com/720P_progressive.mp4?validto=123');
-      assert.strictEqual(result.formats[0].meta.isHls, false);
+      assert.strictEqual(result.formats[0].sourceUrl, 'https://ev-h.phncdn.com/hls/720P.mp4/master.m3u8');
+      assert.strictEqual(result.formats[0].meta.isHls, true);
       assert.strictEqual(result.formats[1].quality, '240p');
-      assert.strictEqual(result.formats[1].sourceUrl, 'https://ev.phncdn.com/240P_progressive.mp4?validto=123');
-      assert.strictEqual(result.formats[1].meta.isHls, false);
+      assert.strictEqual(result.formats[1].sourceUrl, 'https://ev-h.phncdn.com/hls/240P.mp4/master.m3u8');
+      assert.strictEqual(result.formats[1].meta.isHls, true);
 
       // Verify /video/get_media was NEVER added as a downloadable format
       const hasGetMedia = result.formats.some(f => f.sourceUrl.includes('/video/get_media'));
       assert.strictEqual(hasGetMedia, false);
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 16b. Quality mapping uses progressive MP4 when no HLS definitions exist
+  await t.test('16b. Quality mapping uses progressive MP4 with isHls=false when only progressive definitions exist', async () => {
+    const origGet = axios.get;
+    try {
+      axios.get = async (url) => {
+        if (url.includes('view_video.php')) {
+          const sampleHtml = `
+            <script>
+              var flashvars_998 = {
+                "video_title": "Progressive Only Video",
+                "video_duration": 90,
+                "image_url": "https://cdn.example.com/thumb.jpg",
+                "mediaDefinitions": [
+                  {
+                    "format": "mp4",
+                    "quality": "480",
+                    "height": 480,
+                    "videoUrl": "https://ev.phncdn.com/videos/480P_direct.mp4"
+                  }
+                ]
+              };
+            </script>
+          `;
+          return { status: 200, data: sampleHtml };
+        }
+        return origGet(url);
+      };
+
+      const result = await adapter.analyze('https://www.pornhub.com/view_video.php?viewkey=progonly123');
+      assert.strictEqual(result.formats.length, 1);
+      assert.strictEqual(result.formats[0].quality, '480p');
+      assert.strictEqual(result.formats[0].sourceUrl, 'https://ev.phncdn.com/videos/480P_direct.mp4');
+      assert.strictEqual(result.formats[0].meta.isHls, false);
     } finally {
       axios.get = origGet;
     }
@@ -877,7 +915,7 @@ test('Pornhub Adapter - Complete Test Suite', async (t) => {
         }),
         (err) => {
           assert.ok(err instanceof PlatformLimitationError);
-          assert.match(err.message, /no longer available|HTTP 410/i);
+          assert.match(err.message, /Selected HLS format is unavailable|no longer available|HTTP 410/i);
           return true;
         }
       );
@@ -1843,6 +1881,280 @@ seg-0.ts?validfrom=1600000000&validto=1700000000&ipa=1.2.3.4&hash=0123456789abcd
     );
 
     axios.get = origGet;
+  });
+
+  // 48. HLS format calls downloadHlsToFile and never calls downloadStream
+  await t.test('48. HLS format calls downloadHlsToFile and never calls downloadStream', async () => {
+    const origGet = axios.get;
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => {
+      logs.push(args.join(' '));
+      origLog(...args);
+    };
+
+    let downloadStreamCalled = false;
+    let playlistFetched = false;
+    let segmentFetched = false;
+
+    const tmpTs = path.join(os.tmpdir(), `md_test_seg48_${nanoid(8)}.ts`);
+    const { default: ffmpeg } = await import('fluent-ffmpeg');
+    const { default: ffmpegStatic } = await import('ffmpeg-static');
+    if (ffmpegStatic) ffmpeg.setFfmpegPath(ffmpegStatic);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input('testsrc=duration=1:size=320x240:rate=10')
+        .inputFormat('lavfi')
+        .outputOptions(['-c:v libx264', '-f mpegts'])
+        .output(tmpTs)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+    const validTsBuffer = fs.readFileSync(tmpTs);
+
+    try {
+      axios.get = async (url, config = {}) => {
+        if (config.responseType === 'stream' && !url.includes('.ts')) {
+          downloadStreamCalled = true;
+          throw new Error('downloadStream should NOT be called for HLS format!');
+        }
+        if (url.includes('master.m3u8')) {
+          playlistFetched = true;
+          return {
+            status: 200,
+            headers: { 'content-type': 'application/vnd.apple.mpegurl' },
+            data: '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nhttps://di-h.phncdn.com/seg1.ts\n#EXT-X-ENDLIST',
+          };
+        }
+        if (url.includes('seg1.ts')) {
+          segmentFetched = true;
+          return {
+            status: 200,
+            headers: { 'content-type': 'video/mp2t', 'content-length': String(validTsBuffer.length) },
+            data: config.responseType === 'stream' ? Readable.from([validTsBuffer]) : validTsBuffer,
+          };
+        }
+        return origGet(url, config);
+      };
+
+      const result = await adapter.download('https://ev-h.phncdn.com/hls/master.m3u8?validfrom=100&hash=abc', {
+        meta: {
+          quality: '720p',
+          isHls: true,
+          title: 'HLS Test Video',
+        },
+      });
+
+      assert.strictEqual(downloadStreamCalled, false, 'downloadStream must NEVER be called for HLS format');
+      assert.strictEqual(playlistFetched, true, 'HLS playlist must be fetched');
+      assert.strictEqual(segmentFetched, true, 'HLS segment must be fetched');
+      assert.ok(result._tempFilePath, 'HLS download result must include _tempFilePath from downloadHlsToFile');
+      assert.strictEqual(result.mimeType, 'video/mp4');
+      assert.ok(result.stream);
+      await result.cleanup?.();
+
+      const selectionLog = logs.find((l) => l.includes('[Pornhub Download Selection]'));
+      assert.ok(selectionLog, 'Must log [Pornhub Download Selection]');
+      assert.ok(selectionLog.includes('isHls: true'));
+      assert.ok(selectionLog.includes('sourceType: HLS'));
+      assert.ok(selectionLog.includes('sourceOrigin: https://ev-h.phncdn.com'));
+      assert.ok(selectionLog.includes('sourcePath: /hls/master.m3u8'));
+      assert.ok(!selectionLog.includes('validfrom='), 'Signed parameters must be sanitized');
+      assert.ok(!selectionLog.includes('hash='), 'Signed parameters must be sanitized');
+    } finally {
+      axios.get = origGet;
+      console.log = origLog;
+      await fs.promises.unlink(tmpTs).catch(() => {});
+    }
+  });
+
+  // 49. Progressive format calls downloadStream and never calls downloadHlsToFile
+  await t.test('49. Progressive format calls downloadStream and never calls downloadHlsToFile', async () => {
+    const origGet = axios.get;
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => {
+      logs.push(args.join(' '));
+      origLog(...args);
+    };
+
+    let downloadStreamCalled = false;
+    let hlsPlaylistFetched = false;
+
+    try {
+      axios.get = async (url, config = {}) => {
+        if (url.includes('.m3u8')) {
+          hlsPlaylistFetched = true;
+        }
+        if (config.responseType === 'stream') {
+          downloadStreamCalled = true;
+          const fakeStream = Readable.from([Buffer.from('mp4-data')]);
+          return {
+            status: 200,
+            headers: {
+              'content-type': 'video/mp4',
+              'content-length': '8',
+            },
+            data: fakeStream,
+          };
+        }
+        return origGet(url, config);
+      };
+
+      const result = await adapter.download('https://ev.phncdn.com/videos/progressive_480p.mp4?token=abc', {
+        meta: {
+          quality: '480p',
+          isHls: false,
+          title: 'Progressive Test Video',
+        },
+      });
+
+      assert.strictEqual(downloadStreamCalled, true, 'downloadStream MUST be called for progressive format');
+      assert.strictEqual(hlsPlaylistFetched, false, 'downloadHlsToFile must NOT be called for progressive format');
+      assert.strictEqual(result._tempFilePath, undefined, 'Progressive download must not set _tempFilePath');
+      assert.ok(result.stream);
+      result.stream.resume();
+
+      const selectionLog = logs.find((l) => l.includes('[Pornhub Download Selection]'));
+      assert.ok(selectionLog, 'Must log [Pornhub Download Selection]');
+      assert.ok(selectionLog.includes('isHls: false'));
+      assert.ok(selectionLog.includes('sourceType: PROGRESSIVE'));
+      assert.ok(selectionLog.includes('sourceOrigin: https://ev.phncdn.com'));
+      assert.ok(selectionLog.includes('sourcePath: /videos/progressive_480p.mp4'));
+      assert.ok(!selectionLog.includes('token='), 'Signed parameters must be sanitized');
+    } finally {
+      axios.get = origGet;
+      console.log = origLog;
+    }
+  });
+
+  // 50. isHls metadata survives download token serialization and deserialization
+  await t.test('50. isHls metadata survives download token creation and consumption', async () => {
+    // A. HLS token
+    const hlsDownloadId = createDownloadToken({
+      platform: 'pornhub',
+      sourceUrl: 'https://ev-h.phncdn.com/hls/master.m3u8?token=xyz',
+      formatId: 'ph-0',
+      meta: {
+        quality: '1080p',
+        isHls: true,
+        pageUrl: 'https://www.pornhub.com/view_video.php?viewkey=phtest',
+      },
+    });
+    const hlsToken = consumeDownloadToken(hlsDownloadId);
+    assert.ok(hlsToken, 'HLS token must be found');
+    assert.strictEqual(hlsToken.platform, 'pornhub');
+    assert.strictEqual(hlsToken.meta.isHls, true, 'isHls=true must survive token storage');
+    assert.strictEqual(hlsToken.meta.quality, '1080p');
+
+    // B. Progressive token
+    const progDownloadId = createDownloadToken({
+      platform: 'pornhub',
+      sourceUrl: 'https://ev.phncdn.com/videos/720p.mp4?token=123',
+      formatId: 'ph-1',
+      meta: {
+        quality: '720p',
+        isHls: false,
+        pageUrl: 'https://www.pornhub.com/view_video.php?viewkey=phtest',
+      },
+    });
+    const progToken = consumeDownloadToken(progDownloadId);
+    assert.ok(progToken, 'Progressive token must be found');
+    assert.strictEqual(progToken.platform, 'pornhub');
+    assert.strictEqual(progToken.meta.isHls, false, 'isHls=false must survive token storage');
+    assert.strictEqual(progToken.meta.quality, '720p');
+  });
+
+  // 51. HLS does not silently fall back to progressive MP4 when HLS is unavailable
+  await t.test('51. HLS format throws "Selected HLS format is unavailable." and does not fall back to progressive MP4', async () => {
+    const origGet = axios.get;
+    try {
+      axios.get = async (url) => {
+        if (url.includes('.m3u8')) {
+          // HLS URL pre-check fails (e.g. 404 or expired)
+          const err = new Error('HLS playlist missing');
+          err.response = { status: 404 };
+          throw err;
+        }
+        if (url.includes('/video/get_media')) {
+          // get_media returns available progressive MP4 streams
+          return {
+            status: 200,
+            data: [
+              {
+                format: 'mp4',
+                quality: '720',
+                videoUrl: 'https://ev.phncdn.com/videos/progressive_available.mp4',
+              },
+            ],
+          };
+        }
+        return origGet(url);
+      };
+
+      await assert.rejects(
+        () => adapter.download('https://ev-h.phncdn.com/hls/expired.mp4/master.m3u8', {
+          meta: {
+            quality: '720p',
+            isHls: true,
+            getMediaUrl: 'https://www.pornhub.org/video/get_media?s=token123',
+          },
+        }),
+        (err) => {
+          assert.ok(err instanceof PlatformLimitationError, 'Must be PlatformLimitationError');
+          assert.strictEqual(err.message, 'Selected HLS format is unavailable.');
+          return true;
+        }
+      );
+    } finally {
+      axios.get = origGet;
+    }
+  });
+
+  // 52. streamDownloader preserves underlying download errors instead of replacing with generic error
+  await t.test('52. streamDownloader preserves underlying errors for direct and proxy requests', async () => {
+    const { downloadStream } = await import('./utils/streamDownloader.js');
+    const origGet = axios.get;
+
+    try {
+      // 1. Direct connection preserves underlying network error
+      axios.get = async () => {
+        const customErr = new Error('Custom upstream network socket hang up');
+        customErr.code = 'ECONNRESET';
+        throw customErr;
+      };
+
+      await assert.rejects(
+        () => downloadStream('https://example.com/video.mp4', { direct: true }),
+        (err) => {
+          assert.strictEqual(err.message, 'Custom upstream network socket hang up');
+          assert.strictEqual(err.code, 'ECONNRESET');
+          return true;
+        }
+      );
+
+      // 2. Direct connection with PROXY_LIST present in env succeeds and does not trigger phantom proxy error
+      process.env.PROXY_LIST = 'http://127.0.0.1:9999';
+      axios.get = async () => {
+        return {
+          status: 200,
+          headers: {
+            'content-type': 'video/mp4',
+            'content-length': '12',
+          },
+          data: Readable.from([Buffer.from('video payload')]),
+        };
+      };
+
+      const result = await downloadStream('https://example.com/video.mp4', { direct: true });
+      assert.ok(result.stream);
+      result.stream.resume();
+    } finally {
+      delete process.env.PROXY_LIST;
+      axios.get = origGet;
+    }
   });
 
   // Helper function unit test

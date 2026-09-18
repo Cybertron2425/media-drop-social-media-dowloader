@@ -272,13 +272,14 @@ export async function downloadStream(url, options = {}) {
     }
   }
 
-  if (!response || (proxies.length > 0 && !spooledTempPath)) {
-    if (proxies.length > 0 && Date.now() - loopStartTime >= PROXY_TOTAL_BUDGET_MS) {
+  const proxyAttempted = !isDirect && attempts[0] !== null && proxies.length > 0;
+  if (!response || (proxyAttempted && !spooledTempPath)) {
+    if (proxyAttempted && Date.now() - loopStartTime >= PROXY_TOTAL_BUDGET_MS) {
       throw new Error(PROXY_TIMEOUT_ERROR_MESSAGE);
     }
     const err = lastError;
     console.error(
-      `[DownloadStream Error] target=${targetUrl.slice(0, 80)} status=${err?.response?.status} contentType=${err?.response?.headers?.['content-type']} code=${err?.code} err=${err?.message}`
+      `[DownloadStream Error] target=${targetUrl.slice(0, 80)} status=${err?.response?.status} contentType=${err?.response?.headers?.['content-type']} code=${err?.code} err=${err?.message || err || 'No response received'}`
     );
 
     // Preserve specific error types without converting them into generic source error
@@ -305,6 +306,9 @@ export async function downloadStream(url, options = {}) {
       err?.code === 'ENOTFOUND'
     ) {
       throw new Error('This video cannot be downloaded from this source.');
+    }
+    if (err && err.message) {
+      throw err;
     }
     throw err || new Error('This video cannot be downloaded from this source.');
   }

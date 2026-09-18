@@ -1321,8 +1321,8 @@ export class PornhubAdapter extends BaseAdapter {
     }
 
     // Group definitions by quality height.
-    // Prefer Progressive MP4 whenever Pornhub provides it (ev.phncdn.com, isHls: false).
-    // HLS should only be used when no progressive MP4 exists.
+    // When HLS is available (from flashvars or get_media), prioritize HLS formats with isHls: true.
+    // Progressive MP4 is used when progressive definitions exist and no HLS definition exists for that quality.
     const qualityMap = new Map();
 
     for (const pDef of progressiveDefs) {
@@ -1335,11 +1335,31 @@ export class PornhubAdapter extends BaseAdapter {
     }
 
     for (const hDef of hlsDefs) {
-      const height = Number(hDef.height || hDef.quality) || 0;
-      if (height > 0) {
-        const entry = qualityMap.get(height) || {};
-        entry.hlsDef = hDef;
-        qualityMap.set(height, entry);
+      if (Array.isArray(hDef.quality)) {
+        for (const q of hDef.quality) {
+          const height = Number(q) || 0;
+          if (height > 0) {
+            const entry = qualityMap.get(height) || {};
+            entry.hlsDef = { ...hDef, height, quality: `${height}p` };
+            qualityMap.set(height, entry);
+          }
+        }
+      } else {
+        const height = Number(hDef.height || hDef.quality) || 0;
+        if (height > 0) {
+          const entry = qualityMap.get(height) || {};
+          entry.hlsDef = hDef;
+          qualityMap.set(height, entry);
+        } else if (hDef.videoUrl && hDef.videoUrl.includes('.m3u8')) {
+          // Master playlist that can serve any quality variant
+          const existingHeights = Array.from(qualityMap.keys());
+          const targetHeights = existingHeights.length > 0 ? existingHeights : [1080, 720, 480, 240];
+          for (const th of targetHeights) {
+            const entry = qualityMap.get(th) || {};
+            entry.hlsDef = { ...hDef, height: th, quality: `${th}p` };
+            qualityMap.set(th, entry);
+          }
+        }
       }
     }
 
@@ -1347,16 +1367,28 @@ export class PornhubAdapter extends BaseAdapter {
     if (qualityMap.size === 0) {
       for (const def of rawDefinitions) {
         if (!def || typeof def.videoUrl !== 'string' || def.videoUrl.includes('/video/get_media')) continue;
-        const height = Number(def.height || def.quality) || 0;
-        if (height > 0) {
-          const isHls = def.format === 'hls' || def.videoUrl.includes('.m3u8');
-          const normalizedDef = isHls
-            ? { ...def, videoUrl: def.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com') }
-            : def;
-          const entry = qualityMap.get(height) || {};
-          if (isHls) entry.hlsDef = normalizedDef;
-          else entry.progressiveDef = normalizedDef;
-          qualityMap.set(height, entry);
+        const isHls = def.format === 'hls' || def.videoUrl.includes('.m3u8');
+        const normalizedDef = isHls
+          ? { ...def, videoUrl: def.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com') }
+          : def;
+        if (Array.isArray(def.quality)) {
+          for (const q of def.quality) {
+            const height = Number(q) || 0;
+            if (height > 0) {
+              const entry = qualityMap.get(height) || {};
+              if (isHls) entry.hlsDef = normalizedDef;
+              else entry.progressiveDef = normalizedDef;
+              qualityMap.set(height, entry);
+            }
+          }
+        } else {
+          const height = Number(def.height || def.quality) || 0;
+          if (height > 0) {
+            const entry = qualityMap.get(height) || {};
+            if (isHls) entry.hlsDef = normalizedDef;
+            else entry.progressiveDef = normalizedDef;
+            qualityMap.set(height, entry);
+          }
         }
       }
     }
@@ -1365,8 +1397,8 @@ export class PornhubAdapter extends BaseAdapter {
     let formatIdx = 0;
 
     for (const [height, { progressiveDef, hlsDef }] of qualityMap.entries()) {
-      const selectedDef = progressiveDef || hlsDef;
-      const isHls = !progressiveDef && Boolean(hlsDef);
+      const isHls = Boolean(hlsDef);
+      const selectedDef = hlsDef || progressiveDef;
       const vUrl = selectedDef.videoUrl;
       const audioUrl = selectedDef.audioUrl && /^https?:\/\//i.test(selectedDef.audioUrl) ? selectedDef.audioUrl : null;
       const needsMerge = Boolean(audioUrl);
@@ -1385,6 +1417,7 @@ export class PornhubAdapter extends BaseAdapter {
         hasAudio: true,
         hasVideo: true,
         needsMerge,
+        isHls,
         meta: {
           title,
           quality,
@@ -1452,8 +1485,6 @@ export class PornhubAdapter extends BaseAdapter {
       if (base) filename = `${base}.${format}`;
     }
 
-    const activeProxy = null;
-
     const baseHeaders = {
       'User-Agent': DEFAULT_USER_AGENT,
       Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
@@ -1468,112 +1499,107 @@ export class PornhubAdapter extends BaseAdapter {
       ...(options.headers || {}),
     };
 
-    const isHls = Boolean(options.meta?.isHls || sourceUrl.includes('.m3u8'));
+    // Determine HLS: preserve format metadata if isHls is explicitly provided (boolean),
+    // or detect if sourceUrl ends with .m3u8 / contains .m3u8
+    const isHls = options.meta && typeof options.meta.isHls === 'boolean'
+      ? options.meta.isHls
+      : Boolean(sourceUrl && (sourceUrl.includes('.m3u8') || sourceUrl.split('?')[0].endsWith('.m3u8')));
 
-    // Case 1: HLS format (only when progressive MP4 is not available)
-    if (isHls) {
-      let hlsUrl = sourceUrl;
-      if (hlsUrl.includes('hv-h.phncdn.com')) {
-        hlsUrl = hlsUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
-      }
+    let sourceOrigin = '';
+    let sourcePath = '';
+    try {
+      const parsed = new URL(sourceUrl);
+      sourceOrigin = parsed.origin;
+      sourcePath = parsed.pathname;
+    } catch {
+      sourceOrigin = 'unknown';
+      sourcePath = sourceUrl || 'unknown';
+    }
 
-      // Check whether get_media provides a fresh HLS URL with validfrom=, validto=, hash=
-      if (options.meta?.getMediaUrl) {
-        try {
-          const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
-            headers: {
-              'User-Agent': DEFAULT_USER_AGENT,
-              Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
-              Origin: 'https://www.pornhub.com',
-              Accept: 'application/json, text/javascript, */*; q=0.01',
-              Cookie: baseHeaders.Cookie,
-            },
-            proxy: false,
-            direct: true,
-            timeout: 6000,
-            validateStatus: () => true,
-          });
+    console.log(
+      `[Pornhub Download Selection]\n` +
+      `quality: ${options.meta?.quality || 'unknown'}\n` +
+      `isHls: ${isHls}\n` +
+      `sourceType: ${isHls ? 'HLS' : 'PROGRESSIVE'}\n` +
+      `sourceOrigin: ${sourceOrigin}\n` +
+      `sourcePath: ${sourcePath}`
+    );
 
-          if (freshRes.headers?.['set-cookie']) {
-            baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, freshRes.headers['set-cookie']);
-          }
+    const executeDownload = async (targetUrl) => {
+      if (isHls) {
+        let hlsUrl = targetUrl;
+        if (hlsUrl.includes('hv-h.phncdn.com')) {
+          hlsUrl = hlsUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+        }
 
-          logRequestContext(
-            'Refresh get_media',
-            options.meta.getMediaUrl,
-            {
-              'User-Agent': DEFAULT_USER_AGENT,
-              Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
-              Origin: 'https://www.pornhub.com',
-              Accept: 'application/json, text/javascript, */*; q=0.01',
-              Cookie: baseHeaders.Cookie,
-            },
-            freshRes.status,
-            freshRes.headers,
-            null
-          );
+        // Check whether get_media provides a fresh HLS URL with validfrom=, validto=, hash=
+        if (options.meta?.getMediaUrl) {
+          try {
+            const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
+              headers: {
+                'User-Agent': DEFAULT_USER_AGENT,
+                Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+                Origin: 'https://www.pornhub.com',
+                Accept: 'application/json, text/javascript, */*; q=0.01',
+                Cookie: baseHeaders.Cookie,
+              },
+              proxy: false,
+              direct: true,
+              timeout: 6000,
+              validateStatus: () => true,
+            });
 
-          if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
-            const reqQuality = (options.meta?.quality || '').replace('p', '');
-            const hlsCandidates = freshRes.data.filter(
-              (d) =>
-                d &&
-                typeof d.videoUrl === 'string' &&
-                (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
-            );
-            const match = hlsCandidates.find(
-              (d) => String(d.quality) === reqQuality || String(d.height) === reqQuality
-            ) || hlsCandidates[0];
-
-            if (match?.videoUrl) {
-              hlsUrl = match.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
-              console.log(`[HLS Origin Selection]: Refreshed HLS URL from fresh get_media (URL: ${sanitizeUrlForLogging(hlsUrl)})`);
+            if (freshRes.headers?.['set-cookie']) {
+              baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, freshRes.headers['set-cookie']);
             }
+
+            logRequestContext(
+              'Refresh get_media',
+              options.meta.getMediaUrl,
+              {
+                'User-Agent': DEFAULT_USER_AGENT,
+                Referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+                Origin: 'https://www.pornhub.com',
+                Accept: 'application/json, text/javascript, */*; q=0.01',
+                Cookie: baseHeaders.Cookie,
+              },
+              freshRes.status,
+              freshRes.headers,
+              null
+            );
+
+            if (freshRes.status === 200 && Array.isArray(freshRes.data)) {
+              const reqQuality = (options.meta?.quality || '').replace('p', '');
+              const hlsCandidates = freshRes.data.filter(
+                (d) =>
+                  d &&
+                  typeof d.videoUrl === 'string' &&
+                  (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+              );
+              const match = hlsCandidates.find(
+                (d) => String(d.quality) === reqQuality || String(d.height) === reqQuality
+              ) || hlsCandidates[0];
+
+              if (match?.videoUrl) {
+                hlsUrl = match.videoUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+                console.log(`[HLS Origin Selection]: Refreshed HLS URL from fresh get_media (URL: ${sanitizeUrlForLogging(hlsUrl)})`);
+              }
+            }
+          } catch {}
+        }
+
+        let preCheckStatus = null;
+        let verifiedPlaylistSnippet = null;
+        let targetMediaUrl = null;
+
+        // Helper to verify a URL and resolve if master playlist using Render server's DIRECT internet connection
+        const verifyAndResolve = async (candidateUrl) => {
+          let normalized = candidateUrl;
+          if (normalized.includes('hv-h.phncdn.com')) {
+            normalized = normalized.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
           }
-        } catch {}
-      }
 
-      let preCheckStatus = null;
-      let verifiedPlaylistSnippet = null;
-      let targetMediaUrl = null;
-
-      // Helper to verify a URL and resolve if master playlist using Render server's DIRECT internet connection
-      const verifyAndResolve = async (candidateUrl) => {
-        let normalized = candidateUrl;
-        if (normalized.includes('hv-h.phncdn.com')) {
-          normalized = normalized.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
-        }
-
-        const res = await fetchWithProxy(normalized, {
-          headers: baseHeaders,
-          proxy: false,
-          direct: true,
-          timeout: 8000,
-          validateStatus: () => true,
-        });
-
-        if (res.headers?.['set-cookie']) {
-          baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, res.headers['set-cookie']);
-        }
-
-        const resolvedPlaylistUrl = res.finalUrl || normalized;
-        logRedirectDiagnostics('Pre-check Master', normalized, resolvedPlaylistUrl, res.redirects || [], null);
-        logRequestContext('Pre-check Master', normalized, baseHeaders, res.status, res.headers, null);
-
-        if (res.status !== 200 || typeof res.data !== 'string' || !res.data.includes('#EXTM3U')) {
-          return null;
-        }
-
-        const parsed = parseHlsPlaylist(res.data, resolvedPlaylistUrl);
-        if (!parsed.isValid) return null;
-
-        if (parsed.type === 'master') {
-          let childUrl = parsed.mediaPlaylistUrl;
-          if (childUrl.includes('hv-h.phncdn.com')) {
-            childUrl = childUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
-          }
-
-          const childRes = await fetchWithProxy(childUrl, {
+          const res = await fetchWithProxy(normalized, {
             headers: baseHeaders,
             proxy: false,
             direct: true,
@@ -1581,132 +1607,177 @@ export class PornhubAdapter extends BaseAdapter {
             validateStatus: () => true,
           });
 
-          if (childRes.headers?.['set-cookie']) {
-            baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, childRes.headers['set-cookie']);
+          if (res.headers?.['set-cookie']) {
+            baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, res.headers['set-cookie']);
           }
 
-          const resolvedChildUrl = childRes.finalUrl || childUrl;
-          logRedirectDiagnostics('Pre-check Variant', childUrl, resolvedChildUrl, childRes.redirects || [], null);
-          logRequestContext('Pre-check Variant', childUrl, baseHeaders, childRes.status, childRes.headers, null);
+          const resolvedPlaylistUrl = res.finalUrl || normalized;
+          logRedirectDiagnostics('Pre-check Master', normalized, resolvedPlaylistUrl, res.redirects || [], null);
+          logRequestContext('Pre-check Master', normalized, baseHeaders, res.status, res.headers, null);
 
-          if (
-            childRes.status === 200 &&
-            typeof childRes.data === 'string' &&
-            childRes.data.includes('#EXTM3U') &&
-            childRes.data.includes('#EXTINF')
-          ) {
+          if (res.status !== 200 || typeof res.data !== 'string' || !res.data.includes('#EXTM3U')) {
+            return null;
+          }
+
+          const parsed = parseHlsPlaylist(res.data, resolvedPlaylistUrl);
+          if (!parsed.isValid) return null;
+
+          if (parsed.type === 'master') {
+            let childUrl = parsed.mediaPlaylistUrl;
+            if (childUrl.includes('hv-h.phncdn.com')) {
+              childUrl = childUrl.replace('hv-h.phncdn.com', 'ev-h.phncdn.com');
+            }
+
+            const childRes = await fetchWithProxy(childUrl, {
+              headers: baseHeaders,
+              proxy: false,
+              direct: true,
+              timeout: 8000,
+              validateStatus: () => true,
+            });
+
+            if (childRes.headers?.['set-cookie']) {
+              baseHeaders.Cookie = mergeCookies(baseHeaders.Cookie, childRes.headers['set-cookie']);
+            }
+
+            const resolvedChildUrl = childRes.finalUrl || childUrl;
+            logRedirectDiagnostics('Pre-check Variant', childUrl, resolvedChildUrl, childRes.redirects || [], null);
+            logRequestContext('Pre-check Variant', childUrl, baseHeaders, childRes.status, childRes.headers, null);
+
+            if (
+              childRes.status === 200 &&
+              typeof childRes.data === 'string' &&
+              childRes.data.includes('#EXTM3U') &&
+              childRes.data.includes('#EXTINF')
+            ) {
+              return {
+                mediaUrl: resolvedChildUrl,
+                status: childRes.status,
+                snippet: childRes.data.slice(0, 500),
+              };
+            }
+            return null;
+          } else if (parsed.type === 'media') {
             return {
-              mediaUrl: resolvedChildUrl,
-              status: childRes.status,
-              snippet: childRes.data.slice(0, 500),
+              mediaUrl: resolvedPlaylistUrl,
+              status: res.status,
+              snippet: res.data.slice(0, 500),
             };
           }
           return null;
-        } else if (parsed.type === 'media') {
-          return {
-            mediaUrl: resolvedPlaylistUrl,
-            status: res.status,
-            snippet: res.data.slice(0, 500),
-          };
-        }
-        return null;
-      };
+        };
 
-      try {
-        const verified = await verifyAndResolve(hlsUrl);
-        if (verified) {
-          targetMediaUrl = verified.mediaUrl;
-          preCheckStatus = verified.status;
-          verifiedPlaylistSnippet = verified.snippet;
-        }
-      } catch {}
-
-      // If playlist is expired, 403/404/410, or invalid, refresh via pageUrl once
-      if (!targetMediaUrl && options.meta?.pageUrl) {
         try {
-          const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
-            headers: baseHeaders,
-            proxy: false,
-            direct: true,
-            timeout: 10000,
-            validateStatus: () => true,
-          });
+          const verified = await verifyAndResolve(hlsUrl);
+          if (verified) {
+            targetMediaUrl = verified.mediaUrl;
+            preCheckStatus = verified.status;
+            verifiedPlaylistSnippet = verified.snippet;
+          }
+        } catch {}
 
-          if (freshPageRes.status === 200 && typeof freshPageRes.data === 'string') {
-            const freshHtml = freshPageRes.data;
-            const flashMatch = freshHtml.match(/var\s+flashvars_\d+\s*=\s*({.+?});/s);
-            if (flashMatch) {
-              const freshFlashvars = JSON.parse(flashMatch[1]);
-              const freshDefs = Array.isArray(freshFlashvars?.mediaDefinitions)
-                ? freshFlashvars.mediaDefinitions
-                : [];
-              const reqQuality = (options.meta?.quality || '').replace('p', '');
+        // If playlist is expired, 403/404/410, or invalid, refresh via pageUrl once
+        if (!targetMediaUrl && options.meta?.pageUrl) {
+          try {
+            const freshPageRes = await fetchWithProxy(options.meta.pageUrl, {
+              headers: baseHeaders,
+              proxy: false,
+              direct: true,
+              timeout: 10000,
+              validateStatus: () => true,
+            });
 
-              const freshHlsMatch = freshDefs.find(
-                (d) =>
-                  d &&
-                  (String(d.quality) === reqQuality || String(d.height) === reqQuality) &&
-                  typeof d.videoUrl === 'string' &&
-                  (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
-              );
+            if (freshPageRes.status === 200 && typeof freshPageRes.data === 'string') {
+              const freshHtml = freshPageRes.data;
+              const flashMatch = freshHtml.match(/var\s+flashvars_\d+\s*=\s*({.+?});/s);
+              if (flashMatch) {
+                const freshFlashvars = JSON.parse(flashMatch[1]);
+                const freshDefs = Array.isArray(freshFlashvars?.mediaDefinitions)
+                  ? freshFlashvars.mediaDefinitions
+                  : [];
+                const reqQuality = (options.meta?.quality || '').replace('p', '');
 
-              if (freshHlsMatch?.videoUrl) {
-                const freshVerified = await verifyAndResolve(freshHlsMatch.videoUrl);
-                if (freshVerified) {
-                  targetMediaUrl = freshVerified.mediaUrl;
-                  preCheckStatus = freshVerified.status;
-                  verifiedPlaylistSnippet = freshVerified.snippet;
+                const freshHlsMatch = freshDefs.find(
+                  (d) =>
+                    d &&
+                    (String(d.quality) === reqQuality || String(d.height) === reqQuality) &&
+                    typeof d.videoUrl === 'string' &&
+                    (d.format === 'hls' || d.videoUrl.includes('.m3u8'))
+                );
+
+                if (freshHlsMatch?.videoUrl) {
+                  const freshVerified = await verifyAndResolve(freshHlsMatch.videoUrl);
+                  if (freshVerified) {
+                    targetMediaUrl = freshVerified.mediaUrl;
+                    preCheckStatus = freshVerified.status;
+                    verifiedPlaylistSnippet = freshVerified.snippet;
+                  }
                 }
               }
             }
-          }
-        } catch {}
-      }
-
-      if (!targetMediaUrl) {
-        throw new PlatformLimitationError(
-          'The media stream is no longer available on Pornhub (HTTP 410).'
-        );
-      }
-
-      // Safe to run FFmpeg immediately with verified fresh media playlist
-      const tempFilePath = path.join(os.tmpdir(), `md_ph_hls_${nanoid(8)}.mp4`);
-      try {
-        await downloadHlsToFile(targetMediaUrl, tempFilePath, {
-          headers: baseHeaders,
-          cookie: baseHeaders.Cookie,
-          referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
-          pageUrl: options.meta?.pageUrl || 'https://www.pornhub.com/',
-          proxy: null,
-          direct: true,
-          quality: options.meta?.quality,
-          preCheckStatus,
-          playlistSnippet: verifiedPlaylistSnippet,
-        });
-
-        const stat = await fs.promises.stat(tempFilePath);
-        if (stat.size === 0) {
-          throw new Error('Downloaded HLS file is empty.');
+          } catch {}
         }
 
-        const readStream = fs.createReadStream(tempFilePath);
-        return {
-          _tempFilePath: tempFilePath,
-          stream: readStream,
-          filename,
-          mimeType: 'video/mp4',
-          sizeBytes: stat.size,
-          cleanup: async () => {
-            await fs.promises.unlink(tempFilePath).catch(() => {});
-          },
-        };
-      } catch (err) {
-        await fs.promises.unlink(tempFilePath).catch(() => {});
-        throw err;
+        if (!targetMediaUrl) {
+          throw new PlatformLimitationError('Selected HLS format is unavailable.');
+        }
+
+        // Safe to run FFmpeg immediately with verified fresh media playlist
+        const tempFilePath = path.join(os.tmpdir(), `md_ph_hls_${nanoid(8)}.mp4`);
+        try {
+          await downloadHlsToFile(targetMediaUrl, tempFilePath, {
+            headers: baseHeaders,
+            cookie: baseHeaders.Cookie,
+            referer: options.meta?.pageUrl || 'https://www.pornhub.com/',
+            pageUrl: options.meta?.pageUrl || 'https://www.pornhub.com/',
+            proxy: null,
+            direct: true,
+            quality: options.meta?.quality,
+            preCheckStatus,
+            playlistSnippet: verifiedPlaylistSnippet,
+          });
+
+          const stat = await fs.promises.stat(tempFilePath);
+          if (stat.size === 0) {
+            throw new Error('Downloaded HLS file is empty.');
+          }
+
+          const readStream = fs.createReadStream(tempFilePath);
+          return {
+            _tempFilePath: tempFilePath,
+            stream: readStream,
+            filename,
+            mimeType: 'video/mp4',
+            sizeBytes: stat.size,
+            cleanup: async () => {
+              await fs.promises.unlink(tempFilePath).catch(() => {});
+            },
+          };
+        } catch (err) {
+          await fs.promises.unlink(tempFilePath).catch(() => {});
+          throw err;
+        }
       }
+
+      // Case 2: Progressive MP4 format (direct stream proxy via Render server's DIRECT internet connection)
+      return await downloadStream(targetUrl, {
+        ...options,
+        platform: 'pornhub',
+        direct: true,
+        proxy: false,
+        sourceUrl: targetUrl,
+        meta: {
+          ...(options.meta || {}),
+          headers: baseHeaders,
+        },
+      });
+    };
+
+    if (isHls) {
+      return await executeDownload(sourceUrl);
     }
 
-    // Case 2: Progressive MP4 format (direct stream proxy via Render server's DIRECT internet connection)
+    // Case 2: Progressive MP4 format
     if (options.meta?.getMediaUrl) {
       try {
         const freshRes = await fetchWithProxy(options.meta.getMediaUrl, {
@@ -1739,20 +1810,6 @@ export class PornhubAdapter extends BaseAdapter {
         // If fresh check fails, proceed with existing sourceUrl
       }
     }
-
-    const executeDownload = async (targetUrl) => {
-      return await downloadStream(targetUrl, {
-        ...options,
-        platform: 'pornhub',
-        direct: true,
-        proxy: false,
-        sourceUrl: targetUrl,
-        meta: {
-          ...(options.meta || {}),
-          headers: baseHeaders,
-        },
-      });
-    };
 
     try {
       const result = await executeDownload(sourceUrl);
