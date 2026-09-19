@@ -78,7 +78,7 @@ export default function FormatSelector({ formats, mediaType, isHighlight, onDown
               >
                 {formats.map((f) => (
                   <option key={f.downloadId} value={f.downloadId}>
-                    {f.quality || 'Video'} {f.resolution ? `(${f.resolution})` : ''} · {f.format?.toUpperCase()}{f.needsMerge ? ' · May take longer' : ''}
+                    {f.quality || 'Video'}{f.resolution && f.resolution !== f.quality ? ` (${f.resolution})` : ''} · {f.format?.toUpperCase() || 'MP4'}{f.needsMerge ? ' · May take longer' : ''}
                   </option>
                 ))}
               </select>

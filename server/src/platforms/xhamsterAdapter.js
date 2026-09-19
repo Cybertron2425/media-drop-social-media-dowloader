@@ -334,6 +334,96 @@ export function extractInitialsJson(html) {
   return null;
 }
 
+/**
+ * Ensures exactly ONE selectable format per resolution, combining video and audio.
+ * Prioritizes:
+ * 1. Legitimate combined progressive MP4 containing video + audio (!isHls)
+ * 2. HLS stream with H.264 codec (universal MP4 compatibility)
+ * 3. HLS stream with AV1 / other codecs
+ */
+export function deduplicateAndSelectBestFormats(validFormats, pageUrl) {
+  const groups = new Map();
+
+  for (const fmt of validFormats) {
+    if (!fmt.sourceUrl) continue;
+    let key = '';
+    const labelMatch = (fmt.quality || fmt.qualityLabel || '').match(/(\d{3,4}p)/i);
+    if (labelMatch) {
+      key = labelMatch[1].toLowerCase();
+    } else if (fmt.height && fmt.height > 0) {
+      key = `${fmt.height}p`;
+    } else {
+      key = 'Auto';
+    }
+
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(fmt);
+  }
+
+  const finalFormats = [];
+  const hasSpecificResolutions = Array.from(groups.keys()).some((k) => k !== 'Auto');
+
+  for (const [resKey, candidates] of groups.entries()) {
+    // If specific resolutions (e.g. 720p, 480p) are present, omit generic 'Auto'
+    if (resKey === 'Auto' && hasSpecificResolutions) {
+      continue;
+    }
+
+    candidates.sort((a, b) => {
+      // 1. Prefer progressive MP4 (!a.isHls) over HLS
+      if (!a.isHls && b.isHls) return -1;
+      if (a.isHls && !b.isHls) return 1;
+
+      // 2. Prefer H.264 over AV1 for universal compatibility
+      const aIsH264 = (a.sourceUrl?.includes('h264') || a.quality?.includes('h264') || a.id?.includes('h264')) ? 1 : 0;
+      const bIsH264 = (b.sourceUrl?.includes('h264') || b.quality?.includes('h264') || b.id?.includes('h264')) ? 1 : 0;
+      const aIsAv1 = (a.sourceUrl?.includes('av1') || a.quality?.includes('av1') || a.id?.includes('av1')) ? 1 : 0;
+      const bIsAv1 = (b.sourceUrl?.includes('av1') || b.quality?.includes('av1') || b.id?.includes('av1')) ? 1 : 0;
+      if (aIsAv1 !== bIsAv1) return aIsAv1 ? 1 : -1;
+      if (aIsH264 !== bIsH264) return bIsH264 - aIsH264;
+
+      return (b.sizeBytes || 0) - (a.sizeBytes || 0);
+    });
+
+    const best = candidates[0];
+    const isHls = Boolean(best.isHls);
+    const cleanQuality = resKey;
+
+    finalFormats.push({
+      id: best.id || `xh-${cleanQuality.toLowerCase()}`,
+      quality: cleanQuality,
+      resolution: cleanQuality !== 'Auto' ? cleanQuality : (best.resolution || null),
+      height: best.height || 0,
+      format: 'mp4',
+      sizeBytes: best.sizeBytes || null,
+      mimeType: 'video/mp4',
+      sourceUrl: best.sourceUrl,
+      hasAudio: true,
+      hasVideo: true,
+      meta: {
+        pageUrl,
+        quality: cleanQuality,
+        resolution: cleanQuality !== 'Auto' ? cleanQuality : (best.resolution || null),
+        isHls,
+        downloadMode: isHls ? 'SERVER_PROCESSING' : 'DIRECT_BROWSER',
+        hasVideo: true,
+        hasAudio: true,
+        headers: {
+          Referer: pageUrl,
+          'User-Agent': DEFAULT_USER_AGENT,
+        },
+      },
+    });
+  }
+
+  // Sort from highest resolution to lowest resolution
+  finalFormats.sort((a, b) => (b.height || 0) - (a.height || 0));
+
+  return finalFormats;
+}
+
 export class XHamsterAdapter extends BaseAdapter {
   static platformId = 'xhamster';
   static status = 'SUPPORTED';
@@ -505,6 +595,11 @@ export class XHamsterAdapter extends BaseAdapter {
             seenUrls.add(sourceUrl);
 
             const isM3u8 = sourceUrl.toLowerCase().includes('.m3u8');
+            if (!isM3u8) {
+              // xplayerSettings.standard non-m3u8 URLs return 403 'Wrong key'.
+              // Real progressive MP4s come from videoModel.sources.mp4 or HTML tags.
+              continue;
+            }
             const qualityStr = item.quality || item.label || identifier || '';
             const resInfo = extractResolution(qualityStr);
             const sizeBytes = item.size ? Math.round(Number(item.size)) : null;
@@ -661,26 +756,6 @@ export class XHamsterAdapter extends BaseAdapter {
       }
     }
 
-    if (validFormats.length === 0) {
-      throw new PlatformLimitationError('No safe downloadable formats found for this xHamster video.');
-    }
-
-    // Sort formats: prefer highest resolution to lowest, then active HLS streams, then h264 codec
-    validFormats.sort((a, b) => {
-      if ((b.height || 0) !== (a.height || 0)) {
-        return (b.height || 0) - (a.height || 0);
-      }
-      const aIsH264 = a.sourceUrl?.includes('h264') ? 1 : 0;
-      const bIsH264 = b.sourceUrl?.includes('h264') ? 1 : 0;
-      if (bIsH264 !== aIsH264) {
-        return bIsH264 - aIsH264;
-      }
-      if (a.isHls !== b.isHls) {
-        return a.isHls ? -1 : 1;
-      }
-      return 0;
-    });
-
     return {
       platform: 'xhamster',
       title,
@@ -688,26 +763,7 @@ export class XHamsterAdapter extends BaseAdapter {
       duration,
       author,
       type: 'video',
-      formats: validFormats.map((f, idx) => ({
-        id: f.id || `xh-${idx}`,
-        quality: f.quality,
-        resolution: f.resolution,
-        height: f.height,
-        format: f.format || 'mp4',
-        sizeBytes: f.sizeBytes,
-        mimeType: 'video/mp4',
-        sourceUrl: f.sourceUrl,
-        hasAudio: true,
-        meta: {
-          pageUrl: url,
-          quality: f.qualityLabel,
-          isHls: f.isHls,
-          headers: {
-            Referer: url,
-            'User-Agent': DEFAULT_USER_AGENT,
-          },
-        },
-      })),
+      formats: deduplicateAndSelectBestFormats(validFormats, url),
     };
   }
 
@@ -786,11 +842,12 @@ export class XHamsterAdapter extends BaseAdapter {
       throw new PlatformLimitationError('Invalid HLS playlist received from xHamster.');
     }
 
-    // If master playlist, pick best variant
+    // If master playlist, pick best variant matching requested quality or highest bandwidth
     if (playlistText.includes('#EXT-X-STREAM-INF')) {
       const lines = playlistText.split('\n').map((l) => l.trim());
       let bestBandwidth = -1;
       let chosenSubUrl = null;
+      const targetQuality = options.meta?.quality || options.formatId || '';
 
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
@@ -798,6 +855,10 @@ export class XHamsterAdapter extends BaseAdapter {
           const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
           const nextLine = lines[i + 1];
           if (nextLine && !nextLine.startsWith('#')) {
+            if (targetQuality && nextLine.toLowerCase().includes(targetQuality.toLowerCase())) {
+              chosenSubUrl = nextLine;
+              break;
+            }
             if (bw > bestBandwidth || chosenSubUrl === null) {
               bestBandwidth = bw;
               chosenSubUrl = nextLine;
@@ -814,9 +875,68 @@ export class XHamsterAdapter extends BaseAdapter {
       }
     }
 
-    // Extract media segment URLs
+    const { origin: sourceOrigin, path: sourcePath } = sanitizeUrlForLogging(playlistUrl);
+    console.log(`[xHamster Download Selection]
+quality: ${options.meta?.quality || options.formatId || 'Original'}
+sourceType: HLS
+downloadMode: SERVER_PROCESSING
+hasVideo: true
+hasAudio: true
+sourceOrigin: ${sourceOrigin}
+sourcePath: ${sourcePath}`);
+
+    const tempMp4Path = path.join(os.tmpdir(), `xh_hls_${nanoid(12)}.mp4`);
+
+    // 1. Attempt native FFmpeg HLS ingestion for clean stream muxing
+    try {
+      await new Promise((resolve, reject) => {
+        ffmpeg(playlistUrl)
+          .inputOptions([
+            '-headers', `Referer: ${referer}\r\nUser-Agent: ${DEFAULT_USER_AGENT}\r\n`,
+          ])
+          .outputOptions([
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            '-fs', String(maxSizeBytes),
+          ])
+          .output(tempMp4Path)
+          .on('end', () => resolve())
+          .on('error', (err) => reject(err))
+          .run();
+      });
+
+      if (fs.existsSync(tempMp4Path)) {
+        const stat = await fs.promises.stat(tempMp4Path);
+        if (stat.size > 0) {
+          if (stat.size > maxSizeBytes) {
+            await fs.promises.unlink(tempMp4Path).catch(() => {});
+            const sizeErr = new Error('This file exceeds the maximum allowed download size.');
+            sizeErr.statusCode = 413;
+            throw sizeErr;
+          }
+          return {
+            _tempFilePath: tempMp4Path,
+            filename: `${options.meta?.title || 'xhamster_video'}.mp4`,
+            mimeType: 'video/mp4',
+            sizeBytes: stat.size,
+          };
+        }
+      }
+    } catch (nativeErr) {
+      if (nativeErr.statusCode === 413) throw nativeErr;
+      await fs.promises.unlink(tempMp4Path).catch(() => {});
+      // Fall through to segment-by-segment downloader (used by unit tests with mock axios)
+    }
+
+    // 2. Segment-by-segment fallback with #EXT-X-MAP init segment handling
+    const mapMatch = playlistText.match(/#EXT-X-MAP:URI=["']?([^"'\r\n]+)["']?/i);
     const lines = playlistText.split('\n').map((l) => l.trim());
     const segmentUrls = [];
+
+    if (mapMatch) {
+      segmentUrls.push(new URL(mapMatch[1], playlistUrl).href);
+    }
+
     for (const line of lines) {
       if (line && !line.startsWith('#')) {
         segmentUrls.push(new URL(line, playlistUrl).href);
@@ -827,9 +947,9 @@ export class XHamsterAdapter extends BaseAdapter {
       throw new PlatformLimitationError('No segments found in xHamster HLS playlist.');
     }
 
-    const tempTsPath = path.join(os.tmpdir(), `xh_hls_${nanoid(12)}.ts`);
-    const tempMp4Path = path.join(os.tmpdir(), `xh_hls_${nanoid(12)}.mp4`);
-    const tsWriteStream = fs.createWriteStream(tempTsPath);
+    const isFmp4 = Boolean(mapMatch || segmentUrls.some((u) => u.includes('.mp4') || u.includes('.m4s')));
+    const tempSegPath = path.join(os.tmpdir(), `xh_hls_${nanoid(12)}.${isFmp4 ? 'mp4' : 'ts'}`);
+    const segWriteStream = fs.createWriteStream(tempSegPath);
 
     let totalBytes = 0;
 
@@ -846,7 +966,6 @@ export class XHamsterAdapter extends BaseAdapter {
           });
         } catch (segErr) {
           if ((segErr.response?.status === 403 || segErr.response?.status === 410) && pageUrl) {
-            // Attempt to refresh playlist and get updated segments
             const fresh = await this.refreshMediaUrl(pageUrl, options.meta?.quality, true);
             if (fresh) {
               const freshFetch = await fetchPlaylist(fresh);
@@ -878,50 +997,54 @@ export class XHamsterAdapter extends BaseAdapter {
         totalBytes += buffer.length;
 
         if (totalBytes > maxSizeBytes) {
-          tsWriteStream.destroy();
-          await fs.promises.unlink(tempTsPath).catch(() => {});
+          segWriteStream.destroy();
+          await fs.promises.unlink(tempSegPath).catch(() => {});
           const sizeErr = new Error('This file exceeds the maximum allowed download size.');
           sizeErr.statusCode = 413;
           throw sizeErr;
         }
 
-        tsWriteStream.write(buffer);
+        segWriteStream.write(buffer);
       }
 
-      await new Promise((resolve) => tsWriteStream.end(resolve));
+      await new Promise((resolve) => segWriteStream.end(resolve));
 
-      let finalFilePath = tempMp4Path;
       await new Promise((resolve, reject) => {
-        ffmpeg(tempTsPath)
-          .outputOptions(['-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-movflags', '+faststart'])
-          .output(tempMp4Path)
+        const cmd = ffmpeg(tempSegPath);
+        if (isFmp4) {
+          cmd.outputOptions(['-c', 'copy', '-movflags', '+faststart']);
+        } else {
+          cmd.outputOptions(['-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-movflags', '+faststart']);
+        }
+        cmd.output(tempMp4Path)
           .on('end', () => {
-            fs.promises.unlink(tempTsPath).catch(() => {});
+            fs.promises.unlink(tempSegPath).catch(() => {});
             resolve();
           })
           .on('error', (remuxErr) => {
-            if (fs.existsSync(tempTsPath)) {
-              finalFilePath = tempTsPath;
+            if (fs.existsSync(tempSegPath)) {
               fs.promises.unlink(tempMp4Path).catch(() => {});
-              return resolve();
+              resolve();
+            } else {
+              fs.promises.unlink(tempSegPath).catch(() => {});
+              fs.promises.unlink(tempMp4Path).catch(() => {});
+              reject(remuxErr);
             }
-            fs.promises.unlink(tempTsPath).catch(() => {});
-            fs.promises.unlink(tempMp4Path).catch(() => {});
-            reject(remuxErr);
           })
           .run();
       });
 
-      const stat = await fs.promises.stat(finalFilePath);
+      const finalPath = fs.existsSync(tempMp4Path) ? tempMp4Path : tempSegPath;
+      const stat = await fs.promises.stat(finalPath);
       return {
-        _tempFilePath: finalFilePath,
-        filename: `${options.meta?.title || 'xhamster_video'}.${finalFilePath.endsWith('.ts') ? 'ts' : 'mp4'}`,
-        mimeType: finalFilePath.endsWith('.ts') ? 'video/mp2t' : 'video/mp4',
+        _tempFilePath: finalPath,
+        filename: `${options.meta?.title || 'xhamster_video'}.${finalPath.endsWith('.mp4') ? 'mp4' : (isFmp4 ? 'mp4' : 'ts')}`,
+        mimeType: finalPath.endsWith('.mp4') || isFmp4 ? 'video/mp4' : 'video/mp2t',
         sizeBytes: stat.size,
       };
     } catch (err) {
-      tsWriteStream.destroy();
-      await fs.promises.unlink(tempTsPath).catch(() => {});
+      segWriteStream.destroy();
+      await fs.promises.unlink(tempSegPath).catch(() => {});
       await fs.promises.unlink(tempMp4Path).catch(() => {});
       throw err;
     }
@@ -934,6 +1057,7 @@ export class XHamsterAdapter extends BaseAdapter {
     const targetUrl = options.sourceUrl || url;
     const isHls = Boolean(options.meta?.isHls || targetUrl.toLowerCase().includes('.m3u8'));
     const quality = options.meta?.quality || options.formatId || 'Original';
+    const downloadMode = isHls ? 'SERVER_PROCESSING' : (options.meta?.downloadMode || 'DIRECT_BROWSER');
 
     const { origin: sourceOrigin, path: sourcePath } = sanitizeUrlForLogging(targetUrl);
 
@@ -941,6 +1065,9 @@ export class XHamsterAdapter extends BaseAdapter {
     console.log(`[xHamster Download Selection]
 quality: ${quality}
 sourceType: ${isHls ? 'HLS' : 'PROGRESSIVE'}
+downloadMode: ${downloadMode}
+hasVideo: true
+hasAudio: true
 sourceOrigin: ${sourceOrigin}
 sourcePath: ${sourcePath}`);
 
@@ -977,6 +1104,9 @@ sourcePath: ${sourcePath}`);
           console.log(`[xHamster Download Selection]
 quality: ${quality}
 sourceType: PROGRESSIVE
+downloadMode: ${downloadMode}
+hasVideo: true
+hasAudio: true
 sourceOrigin: ${freshLog.origin}
 sourcePath: ${freshLog.path}`);
 

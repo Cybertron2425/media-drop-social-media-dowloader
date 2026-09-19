@@ -81,6 +81,7 @@ export async function analyzeHandler(req, res) {
       size: f.sizeBytes ? `${(f.sizeBytes / (1024 * 1024)).toFixed(1)}MB` : null,
       sizeBytes: f.sizeBytes || null,
       hasAudio: f.hasAudio !== undefined ? f.hasAudio : true,
+      hasVideo: f.hasVideo !== undefined ? f.hasVideo : true,
       needsMerge: Boolean(f.meta?.needsMerge || f.needsMerge),
       downloadId: createDownloadToken({
         platform,

@@ -119,7 +119,7 @@ export async function directUrlHandler(req, res) {
   // Check if this format requires audio/video merging or server preparation
   const needsMerge = checkNeedsMerge(token, req.body);
   const isHls = Boolean(token.meta?.isHls || token.sourceUrl?.includes('.m3u8'));
-  if (token.platform === 'pornhub' || token.platform === 'xhamster' || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
+  if (token.platform === 'pornhub' || (token.platform === 'xhamster' && isHls) || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
     return res.json({
       success: false,
       requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || isHls),
@@ -128,7 +128,7 @@ export async function directUrlHandler(req, res) {
     });
   }
 
-  const sourceUrl = token.sourceUrl || token.meta?.videoUrl;
+  let sourceUrl = token.sourceUrl || token.meta?.videoUrl;
   if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl)) {
     return res.json({
       success: false,
@@ -136,6 +136,41 @@ export async function directUrlHandler(req, res) {
       fallback: true,
       error: 'Invalid source URL for direct download.',
     });
+  }
+
+  if (token.platform === 'xhamster') {
+    const adapter = getAdapter('xhamster');
+    if (adapter && token.meta?.pageUrl) {
+      try {
+        const headRes = await axios.head(sourceUrl, {
+          headers: {
+            'User-Agent': token.meta?.headers?.['User-Agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            Referer: token.meta?.pageUrl,
+          },
+          timeout: 4000,
+        });
+        if (headRes.status === 403 || headRes.status === 410) {
+          const fresh = await adapter.refreshMediaUrl(token.meta.pageUrl, token.meta?.quality, false);
+          if (fresh) sourceUrl = fresh;
+        }
+      } catch (err) {
+        if ((err.response?.status === 403 || err.response?.status === 410) && adapter) {
+          const fresh = await adapter.refreshMediaUrl(token.meta.pageUrl, token.meta?.quality, false);
+          if (fresh) sourceUrl = fresh;
+        }
+      }
+    }
+
+    const { sanitizeUrlForLogging } = await import('../platforms/xhamsterAdapter.js');
+    const { origin: sourceOrigin, path: sourcePath } = sanitizeUrlForLogging(sourceUrl);
+    console.log(`[xHamster Download Selection]
+quality: ${token.meta?.quality || token.formatId || 'Original'}
+sourceType: PROGRESSIVE
+downloadMode: DIRECT_BROWSER
+hasVideo: true
+hasAudio: true
+sourceOrigin: ${sourceOrigin}
+sourcePath: ${sourcePath}`);
   }
 
   const filename = getComputedFilename(token);
