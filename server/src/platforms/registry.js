@@ -7,10 +7,11 @@ import { ThreadsAdapter } from './threads.js';
 import { PublicMediaAdapter } from './publicMedia.js';
 import { YouTubeAdapter } from './youtubeAdapter.js';
 import { PornhubAdapter } from './pornhubAdapter.js';
+import { XHamsterAdapter } from './xhamsterAdapter.js';
 
 /**
  * Platform registry:
- * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, Threads, YouTube, Pornhub
+ * - Dedicated adapters: Instagram, Facebook, Snapchat, TikTok, Twitter/X, Threads, YouTube, Pornhub, xHamster
  * - Generic adapter: PublicMediaAdapter for legitimate third-party public media
  */
 const adapters = [
@@ -22,6 +23,7 @@ const adapters = [
   new ThreadsAdapter(),
   new YouTubeAdapter(),
   new PornhubAdapter(),
+  new XHamsterAdapter(),
   new PublicMediaAdapter(),
 ];
 

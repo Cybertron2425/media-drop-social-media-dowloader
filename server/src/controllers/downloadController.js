@@ -119,7 +119,7 @@ export async function directUrlHandler(req, res) {
   // Check if this format requires audio/video merging or server preparation
   const needsMerge = checkNeedsMerge(token, req.body);
   const isHls = Boolean(token.meta?.isHls || token.sourceUrl?.includes('.m3u8'));
-  if (token.platform === 'pornhub' || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
+  if (token.platform === 'pornhub' || token.platform === 'xhamster' || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
     return res.json({
       success: false,
       requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || isHls),
