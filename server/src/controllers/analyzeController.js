@@ -37,22 +37,37 @@ export async function analyzeHandler(req, res) {
         thumbnail: item.thumbnail,
         type: item.type,
         isHighlight: true,
-        formats: item.formats.map((f) => ({
-          id: f.id,
-          quality: f.quality,
-          resolution: f.resolution || null,
-          format: f.format,
-          size: f.sizeBytes ? `${(f.sizeBytes / (1024 * 1024)).toFixed(1)}MB` : null,
-          sizeBytes: f.sizeBytes || null,
-          hasAudio: f.hasAudio !== undefined ? f.hasAudio : true,
-          needsMerge: Boolean(f.meta?.needsMerge || f.needsMerge),
-          downloadId: createDownloadToken({
-            platform,
-            sourceUrl: f.sourceUrl,
-            formatId: f.id,
-            meta: { mimeType: f.mimeType, ...(f.meta || {}) },
-          }),
-        })),
+        formats: item.formats.map((f) => {
+          const mediaType = f.mediaType || (f.hasVideo === false || f.mimeType?.startsWith('image/') ? 'image' : 'video');
+          const hasVideo = f.hasVideo !== undefined ? f.hasVideo : mediaType === 'video';
+          const hasAudio = f.hasAudio !== undefined ? f.hasAudio : mediaType === 'video';
+          return {
+            id: f.id,
+            quality: f.quality,
+            resolution: f.resolution || null,
+            format: f.format,
+            size: f.sizeBytes ? `${(f.sizeBytes / (1024 * 1024)).toFixed(1)}MB` : null,
+            sizeBytes: f.sizeBytes || null,
+            hasAudio,
+            hasVideo,
+            mediaType,
+            needsMerge: Boolean(f.meta?.needsMerge || f.needsMerge),
+            downloadId: createDownloadToken({
+              platform,
+              sourceUrl: f.sourceUrl,
+              formatId: f.id,
+              meta: {
+                mimeType: f.mimeType,
+                mediaType,
+                hasVideo,
+                hasAudio,
+                format: f.format,
+                title: item.title || info.title,
+                ...(f.meta || {}),
+              },
+            }),
+          };
+        }),
       }));
 
       logEvent({ requestId: req.id, platform, operation: 'analyze', durationMs: Date.now() - start, success: true });
@@ -73,23 +88,37 @@ export async function analyzeHandler(req, res) {
 
     // Attach a short-lived download token to each format instead of exposing
     // the raw source URL to the client.
-    const formats = info.formats.map((f) => ({
-      id: f.id,
-      quality: f.quality,
-      resolution: f.resolution || null,
-      format: f.format,
-      size: f.sizeBytes ? `${(f.sizeBytes / (1024 * 1024)).toFixed(1)}MB` : null,
-      sizeBytes: f.sizeBytes || null,
-      hasAudio: f.hasAudio !== undefined ? f.hasAudio : true,
-      hasVideo: f.hasVideo !== undefined ? f.hasVideo : true,
-      needsMerge: Boolean(f.meta?.needsMerge || f.needsMerge),
-      downloadId: createDownloadToken({
-        platform,
-        sourceUrl: f.sourceUrl,
-        formatId: f.id,
-        meta: { mimeType: f.mimeType, ...(f.meta || {}) },
-      }),
-    }));
+    const formats = info.formats.map((f) => {
+      const mediaType = f.mediaType || (f.hasVideo === false || f.mimeType?.startsWith('image/') ? 'image' : 'video');
+      const hasVideo = f.hasVideo !== undefined ? f.hasVideo : mediaType === 'video';
+      const hasAudio = f.hasAudio !== undefined ? f.hasAudio : mediaType === 'video';
+      return {
+        id: f.id,
+        quality: f.quality,
+        resolution: f.resolution || null,
+        format: f.format,
+        size: f.sizeBytes ? `${(f.sizeBytes / (1024 * 1024)).toFixed(1)}MB` : null,
+        sizeBytes: f.sizeBytes || null,
+        hasAudio,
+        hasVideo,
+        mediaType,
+        needsMerge: Boolean(f.meta?.needsMerge || f.needsMerge),
+        downloadId: createDownloadToken({
+          platform,
+          sourceUrl: f.sourceUrl,
+          formatId: f.id,
+          meta: {
+            mimeType: f.mimeType,
+            mediaType,
+            hasVideo,
+            hasAudio,
+            format: f.format,
+            title: info.title,
+            ...(f.meta || {}),
+          },
+        }),
+      };
+    });
 
     logEvent({ requestId: req.id, platform, operation: 'analyze', durationMs: Date.now() - start, success: true });
 

@@ -88,7 +88,8 @@ export function checkNeedsMerge(token, reqBody = {}) {
  */
 export function getComputedFilename(token) {
   const meta = token?.meta || {};
-  const format = meta.format || (meta.mimeType?.includes('audio') ? 'm4a' : 'mp4');
+  const isImage = meta.mimeType?.includes('image') || meta.mediaType === 'image';
+  const format = meta.format || (meta.mimeType?.includes('audio') ? 'm4a' : (isImage ? 'jpg' : 'mp4'));
   let filename = `${token?.platform || 'media'}_download.${format}`;
   if (meta.title) {
     const base = meta.title
@@ -119,7 +120,7 @@ export async function directUrlHandler(req, res) {
   // Check if this format requires audio/video merging or server preparation
   const needsMerge = checkNeedsMerge(token, req.body);
   const isHls = Boolean(token.meta?.isHls || token.sourceUrl?.includes('.m3u8'));
-  if (token.platform === 'pornhub' || (token.platform === 'xhamster' && isHls) || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
+  if (token.platform === 'pornhub' || token.platform === 'instagram' || (token.platform === 'xhamster' && isHls) || isHls || needsMerge || token.meta?.audioUrl || token.meta?.needsMerge) {
     return res.json({
       success: false,
       requiresPrepare: Boolean(needsMerge || token.meta?.audioUrl || token.meta?.needsMerge || isHls),
@@ -688,15 +689,37 @@ async function streamDownload(downloadId, req, res) {
       return res.status(413).json({ success: false, error: 'This file exceeds the maximum allowed download size.' });
     }
 
-    res.setHeader('Content-Type', result.mimeType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(result.filename)}"`);
+    const extMap = {
+      'video/mp4': '.mp4',
+      'video/webm': '.webm',
+      'image/jpeg': '.jpg',
+      'image/jpg': '.jpg',
+      'image/png': '.png',
+      'image/webp': '.webp',
+    };
+    let finalFilename = result.filename;
+    const cleanMime = (result.mimeType || '').toLowerCase().split(';')[0].trim();
+    const expectedExt = extMap[cleanMime];
+    if (expectedExt) {
+      const curExt = path.extname(finalFilename);
+      if (curExt.toLowerCase() !== expectedExt) {
+        finalFilename = `${finalFilename.replace(/\.[a-zA-Z0-9]+$/, '')}${expectedExt}`;
+      }
+    }
+
+    res.setHeader('Content-Type', cleanMime || result.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(finalFilename)}"`);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
     if (result.statusCode === 206) {
       res.status(206);
       if (result.contentRange) res.setHeader('Content-Range', result.contentRange);
-      if (result.sizeBytes) res.setHeader('Content-Length', result.sizeBytes);
+      const partialLen = result.chunkSizeBytes || (() => {
+        const m = (result.contentRange || '').match(/bytes\s+(\d+)-(\d+)/i);
+        return m ? parseInt(m[2], 10) - parseInt(m[1], 10) + 1 : null;
+      })();
+      if (partialLen) res.setHeader('Content-Length', partialLen);
     } else if (result.sizeBytes) {
       res.setHeader('Content-Length', result.sizeBytes);
     }
@@ -771,6 +794,16 @@ async function streamDownload(downloadId, req, res) {
         success: false,
         error: 'Connection timed out while downloading video segment.',
       });
+    }
+
+    if (err.statusCode === 403 || err.status === 403 || err.response?.status === 403) {
+      return res.status(403).json({ success: false, error: err.message || 'Access denied or media link expired (HTTP 403).' });
+    }
+    if (err.statusCode === 404 || err.status === 404 || err.response?.status === 404) {
+      return res.status(404).json({ success: false, error: err.message || 'Media not found (HTTP 404).' });
+    }
+    if (err.statusCode === 410 || err.status === 410 || err.response?.status === 410) {
+      return res.status(410).json({ success: false, error: err.message || 'Media link has expired (HTTP 410).' });
     }
 
     if (err instanceof PlatformLimitationError) {

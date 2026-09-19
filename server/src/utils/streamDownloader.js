@@ -301,6 +301,7 @@ export async function downloadStream(url, options = {}) {
     if (
       isDirect ||
       options.platform === 'pornhub' ||
+      options.platform === 'instagram' ||
       err?.response?.status === 470
     ) {
       throw err;
@@ -327,9 +328,10 @@ export async function downloadStream(url, options = {}) {
   const ext = hasExt ? rawLastSegment.split('.').pop()?.toLowerCase() || 'bin' : 'bin';
   const filename = decodeURIComponent(rawLastSegment || `download.${ext}`);
   const contentRange = response.headers['content-range'];
-  let sizeBytes = response.headers['content-length']
+  const chunkSizeBytes = response.headers['content-length']
     ? parseInt(response.headers['content-length'], 10)
     : null;
+  let sizeBytes = chunkSizeBytes;
   if (contentRange && typeof contentRange === 'string') {
     const totalMatch = contentRange.match(/\/(\d+)$/);
     if (totalMatch) {
@@ -347,6 +349,7 @@ export async function downloadStream(url, options = {}) {
       filename,
       mimeType: response.headers['content-type'] || mime.lookup(ext) || 'application/octet-stream',
       sizeBytes,
+      chunkSizeBytes,
       statusCode: response.status,
       contentRange: response.headers['content-range'],
     };
@@ -357,6 +360,7 @@ export async function downloadStream(url, options = {}) {
     filename,
     mimeType: response.headers['content-type'] || mime.lookup(ext) || 'application/octet-stream',
     sizeBytes,
+    chunkSizeBytes,
     statusCode: response.status,
     contentRange: response.headers['content-range'],
   };
